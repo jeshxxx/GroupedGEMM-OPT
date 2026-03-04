@@ -39,7 +39,11 @@ struct GroupedGemmArgs {
 
     int num_groups;
 
-    // Device arrays
+    // Host-side problem sizes — must stay alive through initialize() + run()
+    // because CUTLASS reads them on the host to compute grid dimensions.
+    std::vector<UnderlyingProblemShape> host_problem_sizes;
+
+    // Device arrays (kept alive via torch::Tensor ref-counting)
     torch::Tensor problem_sizes_tensor;
     torch::Tensor ptr_A_tensor;
     torch::Tensor ptr_B_tensor;
@@ -63,22 +67,13 @@ struct GroupedGemmArgs {
         const int K = input.size(1);
         const int N = weights.size(1);
 
-        auto opts_int = torch::TensorOptions().dtype(torch::kInt64).device(input.device());
-        auto opts_ptr = torch::TensorOptions().dtype(torch::kInt64).device(input.device());
+        args.host_problem_sizes.resize(args.num_groups);
 
-        // Build on CPU then copy to device in one shot
-        auto cpu_opts_int = torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true);
-
-        // Problem sizes: (M_i, N, K) per group
-        std::vector<UnderlyingProblemShape> h_problem_sizes(args.num_groups);
-
-        // Pointers
         std::vector<const ElementA*> h_ptr_A(args.num_groups);
         std::vector<const ElementB*> h_ptr_B(args.num_groups);
         std::vector<const ElementC*> h_ptr_C(args.num_groups);
         std::vector<ElementC*>       h_ptr_D(args.num_groups);
 
-        // Strides
         std::vector<StrideA> h_stride_A(args.num_groups);
         std::vector<StrideB> h_stride_B(args.num_groups);
         std::vector<StrideC> h_stride_C(args.num_groups);
@@ -90,36 +85,27 @@ struct GroupedGemmArgs {
         for (int g = 0; g < args.num_groups; ++g) {
             int M_g = static_cast<int>(tpe_ptr[g]);
 
-            // Problem size for this group
-            h_problem_sizes[g] = cute::make_shape(M_g, N, K);
+            args.host_problem_sizes[g] = cute::make_shape(M_g, N, K);
 
-            // A: input[token_offset : token_offset + M_g, :]  → row-major [M_g, K]
             h_ptr_A[g] = reinterpret_cast<const ElementA*>(
                 input.data_ptr()) + token_offset * K;
 
-            // B: weights[g]  → stored as [N, K] contiguous = col-major [K, N]
             h_ptr_B[g] = reinterpret_cast<const ElementB*>(
-                weights.data_ptr()) + g * N * K;
+                weights.data_ptr()) + static_cast<int64_t>(g) * N * K;
 
-            // C/D: output[token_offset : token_offset + M_g, :] → row-major [M_g, N]
             h_ptr_C[g] = reinterpret_cast<const ElementC*>(
                 output.data_ptr()) + token_offset * N;
             h_ptr_D[g] = reinterpret_cast<ElementC*>(
                 output.data_ptr()) + token_offset * N;
 
-            // Strides: CUTLASS uses cute::Stride for the 3 modes (M/K, K/N, L)
-            // Row-major A [M,K]: stride = (K, 1, 0)
             h_stride_A[g] = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M_g, K, 1));
-            // Col-major B [K,N]: stride = (1, K, 0) — but B is stored as [N,K] row-major
             h_stride_B[g] = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-            // Row-major C/D [M,N]: stride = (N, 1, 0)
             h_stride_C[g] = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M_g, N, 1));
             h_stride_D[g] = h_stride_C[g];
 
             token_offset += M_g;
         }
 
-        // Allocate device tensors and copy
         auto copy_to_device = [&](const void* src, size_t bytes) -> torch::Tensor {
             auto t = torch::empty({static_cast<int64_t>(bytes)},
                 torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
@@ -128,8 +114,8 @@ struct GroupedGemmArgs {
         };
 
         args.problem_sizes_tensor = copy_to_device(
-            h_problem_sizes.data(),
-            h_problem_sizes.size() * sizeof(UnderlyingProblemShape));
+            args.host_problem_sizes.data(),
+            args.host_problem_sizes.size() * sizeof(UnderlyingProblemShape));
 
         args.ptr_A_tensor = copy_to_device(
             h_ptr_A.data(), h_ptr_A.size() * sizeof(const ElementA*));
@@ -193,9 +179,10 @@ torch::Tensor launch_grouped_gemm(
     typename DeviceGemm::Arguments gemm_args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         // Problem shape: {num_groups, device_problem_sizes, host_problem_sizes}
+        // host_problem_sizes is required for host-side grid shape computation
         {args.num_groups,
          reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_tensor.data_ptr()),
-         nullptr},
+         args.host_problem_sizes.data()},
         // Mainloop arguments: {ptr_A_array, stride_A_array, ptr_B_array, stride_B_array}
         {reinterpret_cast<const typename KernelType::ElementA**>(args.ptr_A_tensor.data_ptr()),
          reinterpret_cast<StrideA*>(args.stride_A_tensor.data_ptr()),

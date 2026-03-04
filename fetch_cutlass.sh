@@ -1,11 +1,12 @@
 #!/bin/bash
 set -e
 
-CUTLASS_VERSION="v3.5.1"
+CUTLASS_VERSION="v3.6.0"
 CUTLASS_DIR="third_party/cutlass"
 
 if [ -d "$CUTLASS_DIR" ]; then
     echo "CUTLASS already exists at $CUTLASS_DIR"
+    echo "  To upgrade, run:  rm -rf $CUTLASS_DIR && bash fetch_cutlass.sh"
     exit 0
 fi
 
