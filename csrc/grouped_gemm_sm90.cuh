@@ -36,10 +36,12 @@ using namespace cute;
 
 // Tile shapes tuned for H100 SM90
 // For MoE where per-expert M can be small, 128x128x64 provides good balance
-// between occupancy and per-tile efficiency
+// between occupancy and per-tile efficiency.
+// ClusterShape 1x1x1 is safest for grouped GEMM where per-expert tile counts
+// can be smaller than the cluster dimension.
 struct GemmConfig128x128x64 {
     using TileShape     = Shape<_128, _128, _64>;
-    using ClusterShape  = Shape<_2, _1, _1>;
+    using ClusterShape  = Shape<_1, _1, _1>;
     static constexpr int AlignmentA = 8;
     static constexpr int AlignmentB = 8;
     static constexpr int AlignmentC = 8;
@@ -94,7 +96,9 @@ struct Sm90GroupedGemmKernel {
     // Grouped problem shape: array of (M_i, N_i, K_i) per expert
     using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
-    // Build epilogue via CollectiveBuilder
+    // ---------- Epilogue (Ptr-Array variant for grouped GEMM) ----------
+    // PtrArrayNoSmemWarpSpecialized: each group has its own C/D pointers,
+    // the epilogue iterates over the per-group pointer array.
     using CollectiveEpilogue =
         typename cutlass::epilogue::collective::CollectiveBuilder<
             cutlass::arch::Sm90,
@@ -102,15 +106,18 @@ struct Sm90GroupedGemmKernel {
             TileShape,
             ClusterShape,
             cutlass::epilogue::collective::EpilogueTileAuto,
-            ElementAccum,     // accumulator
-            ElementAccum,     // compute type for epilogue
+            ElementAccum,
+            ElementAccum,
             ElementC, LayoutC, AlignmentC,
             ElementC, LayoutC, AlignmentC,
-            cutlass::epilogue::NoSmemWarpSpecialized
+            cutlass::epilogue::PtrArrayNoSmemWarpSpecialized
         >::CollectiveOp;
 
-    // Build mainloop via CollectiveBuilder
-    // Uses TMA + GMMA warp-specialized cooperative schedule
+    // ---------- Mainloop (Ptr-Array TMA variant for grouped GEMM) ----------
+    // KernelPtrArrayTmaWarpSpecializedCooperative:
+    //   - Creates TMA descriptors per-group (not one global descriptor)
+    //   - CTAs stay persistent and iterate over groups from a shared work queue
+    //   - TMA loads from per-group A/B pointer arrays
     using CollectiveMainloop =
         typename cutlass::gemm::collective::CollectiveBuilder<
             cutlass::arch::Sm90,
@@ -122,16 +129,16 @@ struct Sm90GroupedGemmKernel {
             ClusterShape,
             cutlass::gemm::collective::StageCountAutoCarveout<
                 static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-            cutlass::gemm::KernelTmaWarpSpecializedCooperative
+            cutlass::gemm::KernelPtrArrayTmaWarpSpecializedCooperative
         >::CollectiveOp;
 
-    // GemmUniversal with PersistentScheduler: tiles from ALL groups are pooled
-    // and dynamically assigned to CTAs → near-perfect load balancing
+    // Tile scheduler = void: the PtrArray kernel has built-in persistent
+    // scheduling that iterates over all groups and their tiles automatically.
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
         ProblemShape,
         CollectiveMainloop,
         CollectiveEpilogue,
-        cutlass::gemm::PersistentScheduler
+        void
     >;
 
     using DeviceGemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;

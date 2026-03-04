@@ -1,6 +1,8 @@
 #include "grouped_gemm.h"
 #include "grouped_gemm_sm90.cuh"
 
+#include "cutlass/kernel_hardware_info.h"
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
@@ -180,24 +182,32 @@ torch::Tensor launch_grouped_gemm(
     auto args = GroupedGemmArgs<KernelType>::prepare(
         input, weights, output, tokens_per_expert, stream);
 
+    // Hardware info: the ptr-array persistent kernel needs to know the SM count
+    // so it can distribute tile work evenly across all resident CTAs.
+    cutlass::KernelHardwareInfo hw_info{};
+    hw_info.device_id = input.device().index();
+    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
+        hw_info.device_id);
+
     // Construct CUTLASS arguments
     typename DeviceGemm::Arguments gemm_args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        // Problem shape
+        // Problem shape: {num_groups, device_problem_sizes, host_problem_sizes}
         {args.num_groups,
          reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_tensor.data_ptr()),
-         nullptr},  // host-side problem sizes (nullptr = device only)
-        // Mainloop arguments: {ptr_A, stride_A, ptr_B, stride_B}
+         nullptr},
+        // Mainloop arguments: {ptr_A_array, stride_A_array, ptr_B_array, stride_B_array}
         {reinterpret_cast<const typename KernelType::ElementA**>(args.ptr_A_tensor.data_ptr()),
          reinterpret_cast<StrideA*>(args.stride_A_tensor.data_ptr()),
          reinterpret_cast<const typename KernelType::ElementB**>(args.ptr_B_tensor.data_ptr()),
          reinterpret_cast<StrideB*>(args.stride_B_tensor.data_ptr())},
-        // Epilogue arguments: {{alpha, beta}, ptr_C, stride_C, ptr_D, stride_D}
+        // Epilogue arguments: {{alpha, beta}, ptr_C_array, stride_C_array, ptr_D_array, stride_D_array}
         {{1.0f, 0.0f},
          reinterpret_cast<const ElementC**>(args.ptr_C_tensor.data_ptr()),
          reinterpret_cast<StrideC*>(args.stride_C_tensor.data_ptr()),
          reinterpret_cast<ElementC**>(args.ptr_D_tensor.data_ptr()),
-         reinterpret_cast<StrideC*>(args.stride_D_tensor.data_ptr())}
+         reinterpret_cast<StrideC*>(args.stride_D_tensor.data_ptr())},
+        hw_info
     };
 
     DeviceGemm gemm_op;
