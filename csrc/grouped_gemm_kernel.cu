@@ -13,12 +13,13 @@
 namespace grouped_gemm {
 
 // ---------------------------------------------------------------------------
-// Helper: build device-side argument arrays for CUTLASS grouped GEMM
+// Helper: build device-side pointer arrays for CUTLASS grouped GEMM
 //
-// CUTLASS grouped GEMM expects per-group arrays of:
-//   - problem_sizes: cute::Shape<int,int,int> per group
-//   - ptr_A / ptr_B / ptr_C / ptr_D: element pointers per group
-//   - stride_A / stride_B / stride_C / stride_D: stride tuples per group
+// The Ptr-Array variant of CUTLASS grouped GEMM expects:
+//   - Per-group arrays: problem_sizes, ptr_A, ptr_B, ptr_C, ptr_D
+//   - Shared across groups: stride_A, stride_B, stride_C, stride_D
+//     (single values, NOT arrays — all experts share the same K and N,
+//      so strides are identical)
 //
 // For MoE, the input tensor is contiguous (tokens sorted by expert), so we
 // compute pointer offsets from the cumulative token count.
@@ -43,20 +44,22 @@ struct GroupedGemmArgs {
     // because CUTLASS reads them on the host to compute grid dimensions.
     std::vector<UnderlyingProblemShape> host_problem_sizes;
 
-    // Device arrays (kept alive via torch::Tensor ref-counting)
+    // Shared strides (same for all groups since K and N are constant)
+    StrideA stride_a;
+    StrideB stride_b;
+    StrideC stride_c;
+    StrideC stride_d;
+
+    // Device arrays for problem sizes and pointers
     torch::Tensor problem_sizes_tensor;
     torch::Tensor ptr_A_tensor;
     torch::Tensor ptr_B_tensor;
     torch::Tensor ptr_C_tensor;
     torch::Tensor ptr_D_tensor;
-    torch::Tensor stride_A_tensor;
-    torch::Tensor stride_B_tensor;
-    torch::Tensor stride_C_tensor;
-    torch::Tensor stride_D_tensor;
 
     static GroupedGemmArgs prepare(
         const torch::Tensor& input,       // [total_tokens, K]
-        const torch::Tensor& weights,     // [num_experts, N, K] col-major (stored as N×K row)
+        const torch::Tensor& weights,     // [num_experts, N, K]
         torch::Tensor& output,            // [total_tokens, N]
         const torch::Tensor& tokens_per_expert,  // [num_experts] on CPU
         cudaStream_t stream)
@@ -67,17 +70,19 @@ struct GroupedGemmArgs {
         const int K = input.size(1);
         const int N = weights.size(1);
 
+        // Strides are shared: they only depend on K and N, not on per-expert M.
+        // Use any valid M (e.g. 1) since M doesn't affect the stride values.
+        args.stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(1, K, 1));
+        args.stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
+        args.stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(1, N, 1));
+        args.stride_d = args.stride_c;
+
         args.host_problem_sizes.resize(args.num_groups);
 
         std::vector<const ElementA*> h_ptr_A(args.num_groups);
         std::vector<const ElementB*> h_ptr_B(args.num_groups);
         std::vector<const ElementC*> h_ptr_C(args.num_groups);
         std::vector<ElementC*>       h_ptr_D(args.num_groups);
-
-        std::vector<StrideA> h_stride_A(args.num_groups);
-        std::vector<StrideB> h_stride_B(args.num_groups);
-        std::vector<StrideC> h_stride_C(args.num_groups);
-        std::vector<StrideC> h_stride_D(args.num_groups);
 
         const auto* tpe_ptr = tokens_per_expert.data_ptr<int64_t>();
         int64_t token_offset = 0;
@@ -97,11 +102,6 @@ struct GroupedGemmArgs {
                 output.data_ptr()) + token_offset * N;
             h_ptr_D[g] = reinterpret_cast<ElementC*>(
                 output.data_ptr()) + token_offset * N;
-
-            h_stride_A[g] = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(M_g, K, 1));
-            h_stride_B[g] = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-            h_stride_C[g] = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(M_g, N, 1));
-            h_stride_D[g] = h_stride_C[g];
 
             token_offset += M_g;
         }
@@ -126,15 +126,6 @@ struct GroupedGemmArgs {
         args.ptr_D_tensor = copy_to_device(
             h_ptr_D.data(), h_ptr_D.size() * sizeof(ElementC*));
 
-        args.stride_A_tensor = copy_to_device(
-            h_stride_A.data(), h_stride_A.size() * sizeof(StrideA));
-        args.stride_B_tensor = copy_to_device(
-            h_stride_B.data(), h_stride_B.size() * sizeof(StrideB));
-        args.stride_C_tensor = copy_to_device(
-            h_stride_C.data(), h_stride_C.size() * sizeof(StrideC));
-        args.stride_D_tensor = copy_to_device(
-            h_stride_D.data(), h_stride_D.size() * sizeof(StrideC));
-
         return args;
     }
 };
@@ -152,6 +143,8 @@ torch::Tensor launch_grouped_gemm(
 {
     using DeviceGemm = typename KernelType::DeviceGemm;
     using GemmKernel = typename KernelType::GemmKernel;
+    using ElementA   = typename KernelType::ElementA;
+    using ElementB   = typename KernelType::ElementB;
     using ElementC   = typename KernelType::ElementC;
     using StrideA    = typename KernelType::StrideA;
     using StrideB    = typename KernelType::StrideB;
@@ -168,49 +161,42 @@ torch::Tensor launch_grouped_gemm(
     auto args = GroupedGemmArgs<KernelType>::prepare(
         input, weights, output, tokens_per_expert, stream);
 
-    // Hardware info: the ptr-array persistent kernel needs to know the SM count
-    // so it can distribute tile work evenly across all resident CTAs.
     cutlass::KernelHardwareInfo hw_info{};
     hw_info.device_id = input.device().index();
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
         hw_info.device_id);
 
-    // Construct CUTLASS arguments
+    // Ptr-Array CUTLASS Arguments:
+    //   Mainloop: {ptr_A_array, stride_A_value, ptr_B_array, stride_B_value}
+    //   Epilogue: {{alpha, beta}, ptr_C_array, stride_C_value, ptr_D_array, stride_D_value}
     typename DeviceGemm::Arguments gemm_args{
         cutlass::gemm::GemmUniversalMode::kGrouped,
-        // Problem shape: {num_groups, device_problem_sizes, host_problem_sizes}
-        // host_problem_sizes is required for host-side grid shape computation
         {args.num_groups,
          reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_tensor.data_ptr()),
          args.host_problem_sizes.data()},
-        // Mainloop arguments: {ptr_A_array, stride_A_array, ptr_B_array, stride_B_array}
-        {reinterpret_cast<const typename KernelType::ElementA**>(args.ptr_A_tensor.data_ptr()),
-         reinterpret_cast<StrideA*>(args.stride_A_tensor.data_ptr()),
-         reinterpret_cast<const typename KernelType::ElementB**>(args.ptr_B_tensor.data_ptr()),
-         reinterpret_cast<StrideB*>(args.stride_B_tensor.data_ptr())},
-        // Epilogue arguments: {{alpha, beta}, ptr_C_array, stride_C_array, ptr_D_array, stride_D_array}
+        {reinterpret_cast<const ElementA**>(args.ptr_A_tensor.data_ptr()),
+         args.stride_a,
+         reinterpret_cast<const ElementB**>(args.ptr_B_tensor.data_ptr()),
+         args.stride_b},
         {{1.0f, 0.0f},
          reinterpret_cast<const ElementC**>(args.ptr_C_tensor.data_ptr()),
-         reinterpret_cast<StrideC*>(args.stride_C_tensor.data_ptr()),
+         args.stride_c,
          reinterpret_cast<ElementC**>(args.ptr_D_tensor.data_ptr()),
-         reinterpret_cast<StrideC*>(args.stride_D_tensor.data_ptr())},
+         args.stride_d},
         hw_info
     };
 
     DeviceGemm gemm_op;
 
-    // Query workspace size
     size_t workspace_size = gemm_op.get_workspace_size(gemm_args);
     auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
         torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
 
-    // Initialize (includes TMA descriptor creation on Hopper)
     cutlass::Status status = gemm_op.initialize(gemm_args, workspace.data_ptr(), stream);
     TORCH_CHECK(status == cutlass::Status::kSuccess,
         "CUTLASS grouped GEMM initialize failed: ",
         cutlassGetStatusString(status));
 
-    // Run
     status = gemm_op.run(stream);
     TORCH_CHECK(status == cutlass::Status::kSuccess,
         "CUTLASS grouped GEMM run failed: ",
