@@ -4,7 +4,28 @@ import sys
 from pathlib import Path
 
 from setuptools import setup, find_packages
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+# Defer torch import so that a helpful message is shown when torch is missing
+# (e.g. when pip's build-isolation creates a temp venv without torch).
+try:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+except ModuleNotFoundError:
+    print(
+        "\n"
+        "ERROR: PyTorch is not found in the current Python environment.\n"
+        "\n"
+        "  This usually happens because pip creates an isolated build\n"
+        "  environment (PEP 517) that does not inherit your installed\n"
+        "  packages.  Fix it with ONE of the following:\n"
+        "\n"
+        "    pip install -e . --no-build-isolation\n"
+        "\n"
+        "  or, if you use an older pip that ignores pyproject.toml:\n"
+        "\n"
+        "    python setup.py develop\n"
+        "\n"
+    )
+    sys.exit(1)
 
 ROOT = Path(__file__).resolve().parent
 CUTLASS_DIR = ROOT / "third_party" / "cutlass"

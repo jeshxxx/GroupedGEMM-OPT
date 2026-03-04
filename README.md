@@ -29,7 +29,8 @@ GEMM on H100.
 cd groupedgemm
 
 # Build and install (CUTLASS is fetched automatically)
-pip install -e .
+# --no-build-isolation is REQUIRED so pip can find your installed PyTorch
+pip install -e . --no-build-isolation
 
 # Or build manually:
 bash fetch_cutlass.sh
