@@ -1,0 +1,10 @@
+[build-system]
+# torch must be pre-installed; we reference it at setup.py import time
+# for CUDAExtension / BuildExtension.
+# "no-build-isolation" is enforced below so pip reuses the caller's
+# environment instead of creating a temporary venv without torch.
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pip]
+no-build-isolation = true
