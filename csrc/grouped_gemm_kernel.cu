@@ -192,23 +192,19 @@ static TileConfig auto_select_tile(
     for (int64_t i = 0; i < num_groups; ++i) total += tpe[i];
     int64_t avg_m = total / std::max(num_groups, int64_t(1));
 
-    // K-tile=128 Pingpong only makes sense when K is large enough to
-    // amortize the deeper pipeline. K must be a multiple of 128 AND have
-    // enough iterations (>= 16) for the pipeline to stay saturated.
-    bool deep_k_viable = (K % 128 == 0) && (K >= 2048);
-
-    if (deep_k_viable && avg_m >= 128) {
-        return TileConfig::PP_128x128x128;
+    // Empirically, Co_128x256x64 is the best for BF16/FP16 across most
+    // MoE workloads: wider N-tile maximizes GMMA utilization and the 64-deep
+    // K-tile keeps shared memory usage reasonable for multi-stage pipelining.
+    //
+    // Pingpong schedule is designed for FP8's higher compute density and
+    // does NOT outperform Cooperative for BF16/FP16 on H100.
+    //
+    // Fall back to 128x128x64 only when N is very small (< 256) where the
+    // 256-wide N-tile would waste compute on padding.
+    if (N < 256) {
+        return TileConfig::Co_128x128x64;
     }
-
-    // For large N and sufficient M, wider tile with Cooperative schedule
-    // (Cooperative is more robust than Pingpong for varied problem sizes)
-    if (N >= 2048 && avg_m >= 256) {
-        return TileConfig::Co_128x256x64;
-    }
-
-    // Default: Cooperative 128x128x64 — safest general-purpose config
-    return TileConfig::Co_128x128x64;
+    return TileConfig::Co_128x256x64;
 }
 
 // ---------------------------------------------------------------------------
