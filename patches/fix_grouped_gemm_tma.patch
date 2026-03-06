@@ -1,0 +1,29 @@
+--- a/include/cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized.hpp
++++ b/include/cutlass/gemm/collective/sm90_mma_array_tma_gmma_ss_warpspecialized.hpp
+@@ -216,9 +216,11 @@
+     // These tensor shapes (only applicable for grouped gemm) and pointers are only used to create tensormap/tma desc.
+     // These will be replaced with correct values before the initial tma load.
+-    int32_t init_M = 1;
+-    int32_t init_N = 1;
+-    int32_t init_K = 1;
++    // Use tile dimensions as minimum valid sizes so cuTensorMapEncodeTiled
++    // succeeds (boxDim must be <= globalDim). Actual values are set at runtime.
++    int32_t init_M = size<0>(TileShape{});
++    int32_t init_N = size<1>(TileShape{});
++    int32_t init_K = size<2>(TileShape{});
+ 
+     // Batches/Groups are managed by using appropriate pointers to input matrices
+     const uint32_t mock_L = 1;
+@@ -229,8 +231,10 @@
+     InternalStrideB stride_b;
+     if constexpr (IsGroupedGemmKernel) {
+       // Strides for Grouped Gemm will be replaced prior to the first access regardless.
+-      stride_a = InternalStrideA{};
+-      stride_b = InternalStrideB{};
++      // Use valid packed strides matching init_M/N/K so the template TMA
++      // descriptor passes cuTensorMapEncodeTiled validation.
++      stride_a = cutlass::make_cute_packed_stride(InternalStrideA{}, cute::make_shape(init_M, init_K, 1));
++      stride_b = cutlass::make_cute_packed_stride(InternalStrideB{}, cute::make_shape(init_N, init_K, 1));
+     }
+     else {
+       // Tensor shapes for Ptr-Array are initialized correctly only here.
