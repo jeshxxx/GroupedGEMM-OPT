@@ -76,7 +76,7 @@ weights_for_grouped_gemm = model_weights.transpose(1, 2).contiguous()
 
 | Config | Tile Shape | Best For |
 |--------|-----------|----------|
-| `TileConfig.SMALL` | 64×128×64 | < 128 avg tokens/expert |
+| `TileConfig.SMALL` | 128×64×64 | < 128 avg tokens/expert |
 | `TileConfig.MEDIUM` | 128×128×64 | 128–512 avg tokens/expert |
 | `TileConfig.LARGE` | 128×256×64 | > 512 avg tokens/expert |
 | `TileConfig.AUTO` | auto-select | Recommended default |

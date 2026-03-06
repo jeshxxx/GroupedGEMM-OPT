@@ -10,7 +10,7 @@ class TileConfig(IntEnum):
     """Tile size strategy for the CUTLASS persistent grouped GEMM kernel.
 
     Auto (default) selects based on average tokens per expert:
-      - Small  (64x128x64):  avg tokens < 128
+      - Small  (128x64x64):  avg tokens < 128
       - Medium (128x128x64): avg tokens in [128, 512)
       - Large  (128x256x64): avg tokens >= 512
     """
