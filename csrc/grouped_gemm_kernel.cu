@@ -257,11 +257,11 @@ torch::Tensor grouped_gemm_forward(
         tile_config = auto_select_tile(tokens_per_expert);
     }
 
+    // SM90 cooperative GMMA constrains minimum tile to 128×128.
+    // Small falls through to Medium (128×128×64).
     if (input.scalar_type() == torch::kHalf) {
         switch (tile_config) {
             case TileConfig::Small:
-                return launch_grouped_gemm<GroupedGemmF16_128x64>(
-                    input, weights, tokens_per_expert, stream);
             case TileConfig::Medium:
                 return launch_grouped_gemm<GroupedGemmF16_128x128>(
                     input, weights, tokens_per_expert, stream);
@@ -274,8 +274,6 @@ torch::Tensor grouped_gemm_forward(
     } else if (input.scalar_type() == torch::kBFloat16) {
         switch (tile_config) {
             case TileConfig::Small:
-                return launch_grouped_gemm<GroupedGemmBF16_128x64>(
-                    input, weights, tokens_per_expert, stream);
             case TileConfig::Medium:
                 return launch_grouped_gemm<GroupedGemmBF16_128x128>(
                     input, weights, tokens_per_expert, stream);

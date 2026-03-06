@@ -52,16 +52,10 @@ struct GemmConfig128x256x64 {
     static constexpr int AlignmentC = 128 / 16;
 };
 
-// Cooperative schedule requires tile M >= 128.
-// For small per-expert M, use a narrower N (64) to produce more tiles
-// along M, improving SM occupancy when tokens/expert is small.
-struct GemmConfig128x64x64 {
-    using TileShape    = Shape<_128, _64, _64>;
-    using ClusterShape = Shape<_1, _1, _1>;
-    static constexpr int AlignmentA = 128 / 16;
-    static constexpr int AlignmentB = 128 / 16;
-    static constexpr int AlignmentC = 128 / 16;
-};
+// SM90 Cooperative schedule + GMMA constraints:
+//   - Tile M >= 128 (warp-specialized cooperative requires 2 warp groups × 64 rows)
+//   - Tile N >= 128 (GMMA MMA atom minimum is MMA_64x128x16)
+// So the smallest valid tile for cooperative FP16/BF16 is 128×128×64.
 
 // ================ Kernel Type Builder (CollectiveBuilder API) ================
 //
@@ -172,12 +166,5 @@ using GroupedGemmBF16_128x256 = Sm90GroupedGemmKernel<
     cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, float,
     GemmConfig128x256x64>;
 
-using GroupedGemmF16_128x64 = Sm90GroupedGemmKernel<
-    cutlass::half_t, cutlass::half_t, cutlass::half_t, float,
-    GemmConfig128x64x64>;
-
-using GroupedGemmBF16_128x64 = Sm90GroupedGemmKernel<
-    cutlass::bfloat16_t, cutlass::bfloat16_t, cutlass::bfloat16_t, float,
-    GemmConfig128x64x64>;
 
 }  // namespace grouped_gemm
