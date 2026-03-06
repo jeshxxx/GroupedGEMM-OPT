@@ -41,6 +41,7 @@ nvcc_flags = [
     "-O3",
     "--use_fast_math",
     "-std=c++17",
+    "-DNDEBUG",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_BFLOAT16_OPERATORS__",
@@ -66,7 +67,7 @@ ext_modules = [
             str(ROOT / "csrc"),
         ],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17"],
+            "cxx": ["-O3", "-std=c++17", "-DNDEBUG"],
             "nvcc": nvcc_flags,
         },
     ),
