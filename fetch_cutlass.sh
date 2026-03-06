@@ -34,8 +34,8 @@ if [ -f "$MAINLOOP_FILE" ]; then
     # InternalStrideA/B are Stride<int64_t, Int<1>, int64_t> for both row/col major.
     # For A [M,K] and B [N,K], leading dimension stride = K.
     # Use cute::make_stride which is already in scope (no extra includes needed).
-    sed -i 's/stride_a = InternalStrideA{};/stride_a = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));/' "$MAINLOOP_FILE"
-    sed -i 's/stride_b = InternalStrideB{};/stride_b = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));/' "$MAINLOOP_FILE"
+    sed -i 's/stride_a = InternalStrideA{};/stride_a = cute::make_stride(int64_t(init_K), cute::Int<1>{}, cute::Int<0>{});/' "$MAINLOOP_FILE"
+    sed -i 's/stride_b = InternalStrideB{};/stride_b = cute::make_stride(int64_t(init_K), cute::Int<1>{}, cute::Int<0>{});/' "$MAINLOOP_FILE"
 
     echo "  Patched: $MAINLOOP_FILE"
 fi
