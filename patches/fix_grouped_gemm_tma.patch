@@ -22,8 +22,8 @@
 -      stride_b = InternalStrideB{};
 +      // Use valid packed strides matching init_M/N/K so the template TMA
 +      // descriptor passes cuTensorMapEncodeTiled validation.
-+      stride_a = cutlass::make_cute_packed_stride(InternalStrideA{}, cute::make_shape(init_M, init_K, 1));
-+      stride_b = cutlass::make_cute_packed_stride(InternalStrideB{}, cute::make_shape(init_N, init_K, 1));
++      stride_a = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));
++      stride_b = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));
      }
      else {
        // Tensor shapes for Ptr-Array are initialized correctly only here.

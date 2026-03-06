@@ -30,9 +30,12 @@ if [ -f "$MAINLOOP_FILE" ]; then
     sed -i 's/int32_t init_N = 1;/int32_t init_N = size<1>(TileShape{});/' "$MAINLOOP_FILE"
     sed -i 's/int32_t init_K = 1;/int32_t init_K = size<2>(TileShape{});/' "$MAINLOOP_FILE"
 
-    # Replace default-initialized strides with valid packed strides
-    sed -i 's/stride_a = InternalStrideA{};/stride_a = cutlass::make_cute_packed_stride(InternalStrideA{}, cute::make_shape(init_M, init_K, 1));/' "$MAINLOOP_FILE"
-    sed -i 's/stride_b = InternalStrideB{};/stride_b = cutlass::make_cute_packed_stride(InternalStrideB{}, cute::make_shape(init_N, init_K, 1));/' "$MAINLOOP_FILE"
+    # Replace default-initialized strides with valid packed strides.
+    # InternalStrideA/B are Stride<int64_t, Int<1>, int64_t> for both row/col major.
+    # For A [M,K] and B [N,K], leading dimension stride = K.
+    # Use cute::make_stride which is already in scope (no extra includes needed).
+    sed -i 's/stride_a = InternalStrideA{};/stride_a = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));/' "$MAINLOOP_FILE"
+    sed -i 's/stride_b = InternalStrideB{};/stride_b = cute::make_stride(int64_t(init_K), cute::Int<1>{}, int64_t(0));/' "$MAINLOOP_FILE"
 
     echo "  Patched: $MAINLOOP_FILE"
 fi
