@@ -13,16 +13,11 @@
 namespace grouped_gemm {
 
 // ---------------------------------------------------------------------------
-// Helper: build device-side pointer arrays for CUTLASS grouped GEMM
+// Helper: build device-side arrays for CUTLASS grouped GEMM.
 //
-// The Ptr-Array variant of CUTLASS grouped GEMM expects:
-//   - Per-group arrays: problem_sizes, ptr_A, ptr_B, ptr_C, ptr_D
-//   - Shared across groups: stride_A, stride_B, stride_C, stride_D
-//     (single values, NOT arrays — all experts share the same K and N,
-//      so strides are identical)
-//
-// For MoE, the input tensor is contiguous (tokens sorted by expert), so we
-// compute pointer offsets from the cumulative token count.
+// Following CUTLASS example 57_hopper_grouped_gemm, the Ptr-Array grouped
+// GEMM with pointer-decorated layouts expects per-group device arrays for
+// BOTH pointers AND strides.
 // ---------------------------------------------------------------------------
 
 template <typename KernelType>
@@ -34,6 +29,7 @@ struct GroupedGemmArgs {
     using StrideA = typename KernelType::StrideA;
     using StrideB = typename KernelType::StrideB;
     using StrideC = typename KernelType::StrideC;
+    using StrideD = typename KernelType::StrideD;
 
     using ProblemShape = typename KernelType::ProblemShape;
     using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
@@ -41,27 +37,24 @@ struct GroupedGemmArgs {
     int num_groups;
 
     // Host-side problem sizes — must stay alive through initialize() + run()
-    // because CUTLASS reads them on the host to compute grid dimensions.
     std::vector<UnderlyingProblemShape> host_problem_sizes;
 
-    // Shared strides (same for all groups since K and N are constant)
-    StrideA stride_a;
-    StrideB stride_b;
-    StrideC stride_c;
-    StrideC stride_d;
-
-    // Device arrays for problem sizes and pointers
-    torch::Tensor problem_sizes_tensor;
-    torch::Tensor ptr_A_tensor;
-    torch::Tensor ptr_B_tensor;
-    torch::Tensor ptr_C_tensor;
-    torch::Tensor ptr_D_tensor;
+    // Device arrays (ref-counted by torch::Tensor)
+    torch::Tensor problem_sizes_device;
+    torch::Tensor ptr_A_device;
+    torch::Tensor ptr_B_device;
+    torch::Tensor ptr_C_device;
+    torch::Tensor ptr_D_device;
+    torch::Tensor stride_A_device;
+    torch::Tensor stride_B_device;
+    torch::Tensor stride_C_device;
+    torch::Tensor stride_D_device;
 
     static GroupedGemmArgs prepare(
-        const torch::Tensor& input,       // [total_tokens, K]
-        const torch::Tensor& weights,     // [num_experts, N, K]
-        torch::Tensor& output,            // [total_tokens, N]
-        const torch::Tensor& tokens_per_expert,  // [num_experts] on CPU
+        const torch::Tensor& input,
+        const torch::Tensor& weights,
+        torch::Tensor& output,
+        const torch::Tensor& tokens_per_expert,
         cudaStream_t stream)
     {
         GroupedGemmArgs args;
@@ -70,19 +63,17 @@ struct GroupedGemmArgs {
         const int K = input.size(1);
         const int N = weights.size(1);
 
-        // Strides are shared: they only depend on K and N, not on per-expert M.
-        // Use any valid M (e.g. 1) since M doesn't affect the stride values.
-        args.stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(1, K, 1));
-        args.stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(N, K, 1));
-        args.stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(1, N, 1));
-        args.stride_d = args.stride_c;
-
         args.host_problem_sizes.resize(args.num_groups);
 
         std::vector<const ElementA*> h_ptr_A(args.num_groups);
         std::vector<const ElementB*> h_ptr_B(args.num_groups);
         std::vector<const ElementC*> h_ptr_C(args.num_groups);
         std::vector<ElementC*>       h_ptr_D(args.num_groups);
+
+        std::vector<StrideA> h_stride_A(args.num_groups);
+        std::vector<StrideB> h_stride_B(args.num_groups);
+        std::vector<StrideC> h_stride_C(args.num_groups);
+        std::vector<StrideD> h_stride_D(args.num_groups);
 
         const auto* tpe_ptr = tokens_per_expert.data_ptr<int64_t>();
         int64_t token_offset = 0;
@@ -94,14 +85,17 @@ struct GroupedGemmArgs {
 
             h_ptr_A[g] = reinterpret_cast<const ElementA*>(
                 input.data_ptr()) + token_offset * K;
-
             h_ptr_B[g] = reinterpret_cast<const ElementB*>(
                 weights.data_ptr()) + static_cast<int64_t>(g) * N * K;
-
             h_ptr_C[g] = reinterpret_cast<const ElementC*>(
                 output.data_ptr()) + token_offset * N;
             h_ptr_D[g] = reinterpret_cast<ElementC*>(
                 output.data_ptr()) + token_offset * N;
+
+            h_stride_A[g] = cutlass::make_cute_packed_stride(StrideA{}, {M_g, K, 1});
+            h_stride_B[g] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+            h_stride_C[g] = cutlass::make_cute_packed_stride(StrideC{}, {M_g, N, 1});
+            h_stride_D[g] = cutlass::make_cute_packed_stride(StrideD{}, {M_g, N, 1});
 
             token_offset += M_g;
         }
@@ -113,25 +107,26 @@ struct GroupedGemmArgs {
             return t;
         };
 
-        args.problem_sizes_tensor = copy_to_device(
+        args.problem_sizes_device = copy_to_device(
             args.host_problem_sizes.data(),
             args.host_problem_sizes.size() * sizeof(UnderlyingProblemShape));
 
-        args.ptr_A_tensor = copy_to_device(
-            h_ptr_A.data(), h_ptr_A.size() * sizeof(const ElementA*));
-        args.ptr_B_tensor = copy_to_device(
-            h_ptr_B.data(), h_ptr_B.size() * sizeof(const ElementB*));
-        args.ptr_C_tensor = copy_to_device(
-            h_ptr_C.data(), h_ptr_C.size() * sizeof(const ElementC*));
-        args.ptr_D_tensor = copy_to_device(
-            h_ptr_D.data(), h_ptr_D.size() * sizeof(ElementC*));
+        args.ptr_A_device = copy_to_device(h_ptr_A.data(), h_ptr_A.size() * sizeof(const ElementA*));
+        args.ptr_B_device = copy_to_device(h_ptr_B.data(), h_ptr_B.size() * sizeof(const ElementB*));
+        args.ptr_C_device = copy_to_device(h_ptr_C.data(), h_ptr_C.size() * sizeof(const ElementC*));
+        args.ptr_D_device = copy_to_device(h_ptr_D.data(), h_ptr_D.size() * sizeof(ElementC*));
+
+        args.stride_A_device = copy_to_device(h_stride_A.data(), h_stride_A.size() * sizeof(StrideA));
+        args.stride_B_device = copy_to_device(h_stride_B.data(), h_stride_B.size() * sizeof(StrideB));
+        args.stride_C_device = copy_to_device(h_stride_C.data(), h_stride_C.size() * sizeof(StrideC));
+        args.stride_D_device = copy_to_device(h_stride_D.data(), h_stride_D.size() * sizeof(StrideD));
 
         return args;
     }
 };
 
 // ---------------------------------------------------------------------------
-// Templated launch function for a specific kernel type
+// Templated launch function
 // ---------------------------------------------------------------------------
 
 template <typename KernelType>
@@ -141,15 +136,15 @@ torch::Tensor launch_grouped_gemm(
     const torch::Tensor& tokens_per_expert,
     cudaStream_t stream)
 {
-    using DeviceGemm = typename KernelType::DeviceGemm;
-    using GemmKernel = typename KernelType::GemmKernel;
-    using ElementA   = typename KernelType::ElementA;
-    using ElementB   = typename KernelType::ElementB;
-    using ElementC   = typename KernelType::ElementC;
-    using StrideA    = typename KernelType::StrideA;
-    using StrideB    = typename KernelType::StrideB;
-    using StrideC    = typename KernelType::StrideC;
-    using ProblemShape = typename KernelType::ProblemShape;
+    using DeviceGemm  = typename KernelType::DeviceGemm;
+    using ElementA    = typename KernelType::ElementA;
+    using ElementB    = typename KernelType::ElementB;
+    using ElementC    = typename KernelType::ElementC;
+    using StrideA     = typename KernelType::StrideA;
+    using StrideB     = typename KernelType::StrideB;
+    using StrideC     = typename KernelType::StrideC;
+    using StrideD     = typename KernelType::StrideD;
+    using ProblemShape          = typename KernelType::ProblemShape;
     using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
 
     const int total_tokens = input.size(0);
@@ -166,23 +161,34 @@ torch::Tensor launch_grouped_gemm(
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
         hw_info.device_id);
 
-    // Ptr-Array CUTLASS Arguments:
-    //   Mainloop: {ptr_A_array, stride_A_value, ptr_B_array, stride_B_value}
-    //   Epilogue: {{alpha, beta}, ptr_C_array, stride_C_value, ptr_D_array, stride_D_value}
-    typename DeviceGemm::Arguments gemm_args{
+    // Build epilogue fusion arguments (scalar alpha=1, beta=0 for all groups)
+    typename DeviceGemm::Arguments gemm_args;
+    decltype(gemm_args.epilogue.thread) fusion_args{};
+    fusion_args.alpha = 1.0f;
+    fusion_args.beta  = 0.0f;
+    fusion_args.alpha_ptr = nullptr;
+    fusion_args.beta_ptr  = nullptr;
+    fusion_args.alpha_ptr_array = nullptr;
+    fusion_args.beta_ptr_array  = nullptr;
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
+    fusion_args.dBeta  = {cute::_0{}, cute::_0{}, 0};
+
+    // Construct arguments exactly matching CUTLASS example 57:
+    //   {mode, problem_shape, mainloop_args, epilogue_args, hw_info}
+    gemm_args = typename DeviceGemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {args.num_groups,
-         reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_tensor.data_ptr()),
+         reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_device.data_ptr()),
          args.host_problem_sizes.data()},
-        {reinterpret_cast<const ElementA**>(args.ptr_A_tensor.data_ptr()),
-         args.stride_a,
-         reinterpret_cast<const ElementB**>(args.ptr_B_tensor.data_ptr()),
-         args.stride_b},
-        {{1.0f, 0.0f},
-         reinterpret_cast<const ElementC**>(args.ptr_C_tensor.data_ptr()),
-         args.stride_c,
-         reinterpret_cast<ElementC**>(args.ptr_D_tensor.data_ptr()),
-         args.stride_d},
+        {reinterpret_cast<const ElementA**>(args.ptr_A_device.data_ptr()),
+         reinterpret_cast<StrideA*>(args.stride_A_device.data_ptr()),
+         reinterpret_cast<const ElementB**>(args.ptr_B_device.data_ptr()),
+         reinterpret_cast<StrideB*>(args.stride_B_device.data_ptr())},
+        {fusion_args,
+         reinterpret_cast<const ElementC**>(args.ptr_C_device.data_ptr()),
+         reinterpret_cast<StrideC*>(args.stride_C_device.data_ptr()),
+         reinterpret_cast<ElementC**>(args.ptr_D_device.data_ptr()),
+         reinterpret_cast<StrideD*>(args.stride_D_device.data_ptr())},
         hw_info
     };
 
@@ -224,7 +230,7 @@ static TileConfig auto_select_tile(const torch::Tensor& tokens_per_expert) {
 }
 
 // ---------------------------------------------------------------------------
-// Public API: dispatch based on dtype and tile config
+// Public API
 // ---------------------------------------------------------------------------
 
 torch::Tensor grouped_gemm_forward(
@@ -251,7 +257,6 @@ torch::Tensor grouped_gemm_forward(
         tile_config = auto_select_tile(tokens_per_expert);
     }
 
-    // Dispatch based on dtype × tile config
     if (input.scalar_type() == torch::kHalf) {
         switch (tile_config) {
             case TileConfig::Small:
