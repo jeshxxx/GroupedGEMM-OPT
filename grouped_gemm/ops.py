@@ -79,11 +79,10 @@ def _sort_by_descending_m(
 ):
     """Sort experts by descending token count for better load balance.
 
-    The persistent tile scheduler assigns tiles round-robin. When large
-    experts appear first, tiles with heavy K-dimension work are spread
-    evenly across CTAs, reducing the tail effect.
+    Reorders input segments and weight pointers so the persistent tile
+    scheduler processes large experts first, reducing tail effects.
 
-    This reorders the input segments and weight matrices accordingly.
+    Uses vectorized ops on GPU — no Python loops in the hot path.
     """
     sorted_indices = torch.argsort(tokens_per_expert, descending=True)
 
@@ -96,18 +95,14 @@ def _sort_by_descending_m(
     offsets = torch.zeros(len(tokens_per_expert) + 1, dtype=torch.int64)
     torch.cumsum(tokens_per_expert, 0, out=offsets[1:])
 
-    new_offsets = torch.zeros_like(offsets)
-    torch.cumsum(tpe_sorted, 0, out=new_offsets[1:])
+    lengths = tpe_sorted.tolist()
+    starts = [offsets[idx].item() for idx in sorted_indices.tolist()]
 
-    gather_idx = torch.empty(input.size(0), dtype=torch.int64, device=input.device)
-    new_off = 0
-    for i, orig_idx in enumerate(sorted_indices.tolist()):
-        m = tokens_per_expert[orig_idx].item()
-        if m > 0:
-            orig_start = offsets[orig_idx].item()
-            gather_idx[new_off:new_off + m] = torch.arange(
-                orig_start, orig_start + m, device=input.device)
-        new_off += m
+    parts = []
+    for s, l in zip(starts, lengths):
+        if l > 0:
+            parts.append(torch.arange(s, s + l, device=input.device))
+    gather_idx = torch.cat(parts)
 
     input_sorted = input[gather_idx]
     return input_sorted, weights_sorted, tpe_sorted

@@ -7,7 +7,7 @@ Compares:
   3. Batched cuBLAS — padded to max-M, batched launch
   4. CUTLASS Persistent Grouped GEMM — our optimized kernel
 
-Metrics: latency (ms), TFLOPS, efficiency vs dense GEMM
+Metrics: latency (ms), TFLOPS, efficiency vs dense GEMM, numerical accuracy
 """
 
 import argparse
@@ -126,6 +126,82 @@ def batched_gemm_padded(
 
 
 # ---------------------------------------------------------------------------
+# Accuracy verification
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AccuracyResult:
+    name: str
+    max_abs_err: float
+    mean_abs_err: float
+    max_rel_err: float
+    cos_sim: float
+    passed: bool
+
+
+def verify_accuracy(
+    total_tokens: int,
+    num_experts: int,
+    K: int,
+    N: int,
+    dtype: torch.dtype,
+) -> List[AccuracyResult]:
+    """Compare CUTLASS grouped GEMM outputs against sequential cuBLAS (ground truth)."""
+
+    device = torch.device("cuda:0")
+    results = []
+
+    tpe = uniform_distribution(total_tokens, num_experts)
+    input_tensor = torch.randn(total_tokens, K, device=device, dtype=dtype)
+    expert_weights = torch.randn(num_experts, N, K, device=device, dtype=dtype)
+
+    ref_output = sequential_gemm(input_tensor, expert_weights, tpe)
+    torch.cuda.synchronize()
+
+    if not HAS_CUTLASS_GROUPED:
+        return results
+
+    configs = [
+        ("Co 128x128x64",  TileConfig.Co_128x128x64),
+        ("Co 128x256x64",  TileConfig.Co_128x256x64),
+        ("PP 128x128x128", TileConfig.PP_128x128x128),
+        ("PP 128x256x64",  TileConfig.PP_128x256x64),
+    ]
+
+    for tc_name, tc in configs:
+        try:
+            test_output = grouped_gemm(input_tensor, expert_weights, tpe, tc,
+                                       sort_by_m=False)
+            torch.cuda.synchronize()
+
+            diff = (test_output.float() - ref_output.float()).abs()
+            ref_abs = ref_output.float().abs().clamp(min=1e-6)
+
+            max_abs = diff.max().item()
+            mean_abs = diff.mean().item()
+            max_rel = (diff / ref_abs).max().item()
+
+            flat_test = test_output.float().flatten()
+            flat_ref = ref_output.float().flatten()
+            cos = torch.nn.functional.cosine_similarity(
+                flat_test.unsqueeze(0), flat_ref.unsqueeze(0)).item()
+
+            atol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+            rtol = 1e-2
+            passed = torch.allclose(test_output.float(), ref_output.float(),
+                                    atol=atol, rtol=rtol)
+
+            results.append(AccuracyResult(tc_name, max_abs, mean_abs, max_rel,
+                                          cos, passed))
+        except Exception as e:
+            results.append(AccuracyResult(tc_name, float('inf'), float('inf'),
+                                          float('inf'), 0.0, False))
+            print(f"  WARNING: {tc_name} failed: {e}")
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Benchmark harness
 # ---------------------------------------------------------------------------
 
@@ -222,7 +298,8 @@ def run_benchmark(
         for tc_name, tc in configs:
             try:
                 cutlass_latency = benchmark_fn(
-                    lambda tc=tc: grouped_gemm(input_tensor, expert_weights, tpe, tc))
+                    lambda tc=tc: grouped_gemm(input_tensor, expert_weights, tpe, tc,
+                                               sort_by_m=False))
                 cutlass_tflops = total_flops / (cutlass_latency * 1e-3) / 1e12
                 results.append(BenchResult(
                     f"CUTLASS ({tc_name})",
@@ -282,6 +359,25 @@ def main():
             eff_str = f"{r.efficiency:.1%}" if r.efficiency > 0 else "N/A"
             lat_str = f"{r.latency_ms:.3f}" if r.latency_ms < float('inf') else "FAIL"
             print(f"  {r.name:<30} {lat_str:>12} {r.tflops:>10.2f} {eff_str:>10}")
+
+    # Accuracy verification
+    if HAS_CUTLASS_GROUPED:
+        print(f"\n\n{'=' * 90}")
+        print("Accuracy: CUTLASS vs Sequential cuBLAS (ground truth)")
+        print(f"  Reference: per-expert cuBLAS GEMM (FP32 accumulate)")
+        print(f"{'=' * 90}")
+        print(f"  {'Config':<20} {'MaxAbs':>10} {'MeanAbs':>10} {'MaxRel':>10} "
+              f"{'CosSim':>10} {'Status':>8}")
+        print(f"  {'─' * 72}")
+
+        acc_results = verify_accuracy(
+            min(args.total_tokens, 4096), args.num_experts,
+            args.hidden_dim, args.ffn_dim, dtype)
+
+        for r in acc_results:
+            status = "PASS" if r.passed else "FAIL"
+            print(f"  {r.name:<20} {r.max_abs_err:>10.6f} {r.mean_abs_err:>10.6f} "
+                  f"{r.max_rel_err:>10.6f} {r.cos_sim:>10.8f} {status:>8}")
 
     # Sweep over different MoE configurations
     print(f"\n\n{'=' * 90}")

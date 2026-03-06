@@ -192,19 +192,22 @@ static TileConfig auto_select_tile(
     for (int64_t i = 0; i < num_groups; ++i) total += tpe[i];
     int64_t avg_m = total / std::max(num_groups, int64_t(1));
 
-    // Pingpong 128x128x128 is best when K is large enough for deep K-tile
-    // and avg M is moderate (good tile coverage without wasting compute).
-    // Cluster 2x1x1 benefits from L2 multicast along M.
-    if (K >= 1024 && avg_m >= 128) {
+    // K-tile=128 Pingpong only makes sense when K is large enough to
+    // amortize the deeper pipeline. K must be a multiple of 128 AND have
+    // enough iterations (>= 16) for the pipeline to stay saturated.
+    bool deep_k_viable = (K % 128 == 0) && (K >= 2048);
+
+    if (deep_k_viable && avg_m >= 128) {
         return TileConfig::PP_128x128x128;
     }
 
-    // Large N → wider tile helps
+    // For large N and sufficient M, wider tile with Cooperative schedule
+    // (Cooperative is more robust than Pingpong for varied problem sizes)
     if (N >= 2048 && avg_m >= 256) {
-        return TileConfig::PP_128x256x64;
+        return TileConfig::Co_128x256x64;
     }
 
-    // Fallback: Cooperative 128x128x64 (smallest valid tile)
+    // Default: Cooperative 128x128x64 — safest general-purpose config
     return TileConfig::Co_128x128x64;
 }
 
