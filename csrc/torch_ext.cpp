@@ -20,5 +20,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("input"),
         py::arg("weights"),
         py::arg("tokens_per_expert"),
-        py::arg("tile_config") = 3  /* Auto */);
+        py::arg("tile_config") = 4  /* Auto */);
 }

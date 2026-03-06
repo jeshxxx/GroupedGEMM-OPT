@@ -210,23 +210,27 @@ def run_benchmark(
     results.append(BenchResult("Batched cuBLAS (pad)", batch_latency, batch_tflops,
                                dense_latency / batch_latency))
 
-    # 4. CUTLASS Persistent Grouped GEMM
+    # 4. CUTLASS Persistent Grouped GEMM — all configs
     if HAS_CUTLASS_GROUPED:
-        for tc_name, tc in [("Auto", TileConfig.AUTO),
-                            ("Small", TileConfig.SMALL),
-                            ("Medium", TileConfig.MEDIUM),
-                            ("Large", TileConfig.LARGE)]:
+        configs = [
+            ("Auto",           TileConfig.AUTO),
+            ("Co 128x128x64",  TileConfig.Co_128x128x64),
+            ("Co 128x256x64",  TileConfig.Co_128x256x64),
+            ("PP 128x128x128", TileConfig.PP_128x128x128),
+            ("PP 128x256x64",  TileConfig.PP_128x256x64),
+        ]
+        for tc_name, tc in configs:
             try:
                 cutlass_latency = benchmark_fn(
                     lambda tc=tc: grouped_gemm(input_tensor, expert_weights, tpe, tc))
                 cutlass_tflops = total_flops / (cutlass_latency * 1e-3) / 1e12
                 results.append(BenchResult(
-                    f"CUTLASS Persistent ({tc_name})",
+                    f"CUTLASS ({tc_name})",
                     cutlass_latency, cutlass_tflops,
                     dense_latency / cutlass_latency))
             except Exception as e:
                 results.append(BenchResult(
-                    f"CUTLASS Persistent ({tc_name})",
+                    f"CUTLASS ({tc_name})",
                     float('inf'), 0.0, 0.0))
                 print(f"  WARNING: {tc_name} failed: {e}")
 

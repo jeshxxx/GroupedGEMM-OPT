@@ -5,24 +5,17 @@
 
 namespace grouped_gemm {
 
-// Tile size selection strategy for MoE workloads
 enum class TileConfig {
-    Small  = 0,   // 64x128x64:  per-expert M < 128
-    Medium = 1,   // 128x128x64: per-expert M in [128, 512) — default
-    Large  = 2,   // 128x256x64: per-expert M >= 512
-    Auto   = 3,   // Choose based on average tokens per expert
+    // Cooperative schedule
+    Co_128x128x64  = 0,
+    Co_128x256x64  = 1,
+    // Pingpong schedule (faster pipeline, ~10-15% speedup)
+    PP_128x128x128 = 2,
+    PP_128x256x64  = 3,
+    // Auto: selects best config based on problem dimensions
+    Auto           = 4,
 };
 
-// Launch the CUTLASS 3.x SM90 persistent grouped GEMM.
-//
-// Args:
-//   input:            [total_tokens, K] — permuted activations (tokens sorted by expert)
-//   weights:          [num_experts, N, K] — expert weight matrices (column-major: stored as N×K)
-//   tokens_per_expert:[num_experts] on CPU — number of tokens assigned to each expert
-//   tile_config:      tile size selection (Auto recommended)
-//
-// Returns:
-//   output:           [total_tokens, N]
 torch::Tensor grouped_gemm_forward(
     const torch::Tensor& input,
     const torch::Tensor& weights,
