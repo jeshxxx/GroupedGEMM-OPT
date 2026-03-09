@@ -89,14 +89,15 @@ struct GroupedGemmArgs {
         args.off_stride_D = cursor;      cursor += align_up(sz_sD);
         size_t total_bytes = cursor;
 
-        // Pinned host buffer: makes cudaMemcpyAsync truly asynchronous
-        // (pageable memory silently falls back to synchronous copy)
-        char* host_buf_raw = nullptr;
-        cudaMallocHost(&host_buf_raw, total_bytes);
+        // Thread-local host buffer avoids re-allocation on every call.
+        // For tiny buffers (few KB), pageable memory + sync copy is faster
+        // than cudaMallocHost/cudaFreeHost which are expensive kernel-mode calls.
+        thread_local std::vector<char> host_buf_storage;
+        if (host_buf_storage.size() < total_bytes) {
+            host_buf_storage.resize(total_bytes);
+        }
+        char* host_buf_raw = host_buf_storage.data();
         std::memset(host_buf_raw, 0, total_bytes);
-        // Wrap in unique_ptr for RAII cleanup
-        auto host_buf_deleter = [](char* p) { if (p) cudaFreeHost(p); };
-        std::unique_ptr<char, decltype(host_buf_deleter)> host_buf_owner(host_buf_raw, host_buf_deleter);
 
         auto* h_ps = reinterpret_cast<UnderlyingProblemShape*>(host_buf_raw + args.off_problem_sizes);
         auto* h_pA = reinterpret_cast<const ElementA**>(host_buf_raw + args.off_ptr_A);
@@ -129,9 +130,15 @@ struct GroupedGemmArgs {
             off += M_g;
         }
 
-        // Single device allocation + single H2D copy
-        args.packed_device_buf = torch::empty({static_cast<int64_t>(total_bytes)},
-            torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+        // Cached device buffer — avoids torch::empty overhead on repeat calls
+        thread_local torch::Tensor cached_dev_buf;
+        thread_local size_t cached_dev_size = 0;
+        if (total_bytes > cached_dev_size) {
+            cached_dev_buf = torch::empty({static_cast<int64_t>(total_bytes)},
+                torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+            cached_dev_size = total_bytes;
+        }
+        args.packed_device_buf = cached_dev_buf;
         cudaMemcpyAsync(args.packed_device_buf.data_ptr(), host_buf_raw,
                         total_bytes, cudaMemcpyHostToDevice, stream);
 
