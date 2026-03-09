@@ -8,13 +8,14 @@
 #include <torch/torch.h>
 
 #include <cuda_runtime.h>
+#include <cstring>
 #include <vector>
-#include <algorithm>
 
 namespace grouped_gemm {
 
 // ---------------------------------------------------------------------------
-// Per-group device arrays for CUTLASS grouped GEMM
+// Packed argument buffer: all per-group arrays in ONE contiguous allocation
+// and ONE cudaMemcpyAsync, eliminating 8 extra alloc+copy round trips.
 // ---------------------------------------------------------------------------
 
 template <typename KernelType>
@@ -32,9 +33,23 @@ struct GroupedGemmArgs {
     int num_groups;
     std::vector<UnderlyingProblemShape> host_problem_sizes;
 
-    torch::Tensor problem_sizes_device;
-    torch::Tensor ptr_A_device, ptr_B_device, ptr_C_device, ptr_D_device;
-    torch::Tensor stride_A_device, stride_B_device, stride_C_device, stride_D_device;
+    // Single device buffer holding all argument arrays contiguously
+    torch::Tensor packed_device_buf;
+
+    // Offsets into packed buffer (in bytes)
+    size_t off_problem_sizes;
+    size_t off_ptr_A, off_ptr_B, off_ptr_C, off_ptr_D;
+    size_t off_stride_A, off_stride_B, off_stride_C, off_stride_D;
+
+    template <typename T>
+    T* dev_ptr(size_t byte_offset) {
+        return reinterpret_cast<T*>(
+            static_cast<char*>(packed_device_buf.data_ptr()) + byte_offset);
+    }
+
+    static size_t align_up(size_t x, size_t a = 16) {
+        return (x + a - 1) & ~(a - 1);
+    }
 
     static GroupedGemmArgs prepare(
         const torch::Tensor& input,
@@ -47,54 +62,73 @@ struct GroupedGemmArgs {
         args.num_groups = tokens_per_expert.size(0);
         const int K = input.size(1);
         const int N = weights.size(1);
+        const int G = args.num_groups;
 
-        args.host_problem_sizes.resize(args.num_groups);
+        args.host_problem_sizes.resize(G);
 
-        std::vector<const ElementA*> h_ptr_A(args.num_groups);
-        std::vector<const ElementB*> h_ptr_B(args.num_groups);
-        std::vector<const ElementC*> h_ptr_C(args.num_groups);
-        std::vector<ElementC*>       h_ptr_D(args.num_groups);
-        std::vector<StrideA> h_stride_A(args.num_groups);
-        std::vector<StrideB> h_stride_B(args.num_groups);
-        std::vector<StrideC> h_stride_C(args.num_groups);
-        std::vector<StrideD> h_stride_D(args.num_groups);
+        // Compute packed layout sizes (all arrays contiguous, 16B aligned)
+        size_t sz_ps  = G * sizeof(UnderlyingProblemShape);
+        size_t sz_pA  = G * sizeof(const ElementA*);
+        size_t sz_pB  = G * sizeof(const ElementB*);
+        size_t sz_pC  = G * sizeof(const ElementC*);
+        size_t sz_pD  = G * sizeof(ElementC*);
+        size_t sz_sA  = G * sizeof(StrideA);
+        size_t sz_sB  = G * sizeof(StrideB);
+        size_t sz_sC  = G * sizeof(StrideC);
+        size_t sz_sD  = G * sizeof(StrideD);
+
+        size_t cursor = 0;
+        args.off_problem_sizes = cursor; cursor += align_up(sz_ps);
+        args.off_ptr_A = cursor;         cursor += align_up(sz_pA);
+        args.off_ptr_B = cursor;         cursor += align_up(sz_pB);
+        args.off_ptr_C = cursor;         cursor += align_up(sz_pC);
+        args.off_ptr_D = cursor;         cursor += align_up(sz_pD);
+        args.off_stride_A = cursor;      cursor += align_up(sz_sA);
+        args.off_stride_B = cursor;      cursor += align_up(sz_sB);
+        args.off_stride_C = cursor;      cursor += align_up(sz_sC);
+        args.off_stride_D = cursor;      cursor += align_up(sz_sD);
+        size_t total_bytes = cursor;
+
+        // Build everything in one host buffer
+        std::vector<char> host_buf(total_bytes, 0);
+
+        auto* h_ps = reinterpret_cast<UnderlyingProblemShape*>(host_buf.data() + args.off_problem_sizes);
+        auto* h_pA = reinterpret_cast<const ElementA**>(host_buf.data() + args.off_ptr_A);
+        auto* h_pB = reinterpret_cast<const ElementB**>(host_buf.data() + args.off_ptr_B);
+        auto* h_pC = reinterpret_cast<const ElementC**>(host_buf.data() + args.off_ptr_C);
+        auto* h_pD = reinterpret_cast<ElementC**>(host_buf.data() + args.off_ptr_D);
+        auto* h_sA = reinterpret_cast<StrideA*>(host_buf.data() + args.off_stride_A);
+        auto* h_sB = reinterpret_cast<StrideB*>(host_buf.data() + args.off_stride_B);
+        auto* h_sC = reinterpret_cast<StrideC*>(host_buf.data() + args.off_stride_C);
+        auto* h_sD = reinterpret_cast<StrideD*>(host_buf.data() + args.off_stride_D);
 
         const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
         int64_t off = 0;
 
-        for (int g = 0; g < args.num_groups; ++g) {
+        for (int g = 0; g < G; ++g) {
             int M_g = static_cast<int>(tpe[g]);
             args.host_problem_sizes[g] = cute::make_shape(M_g, N, K);
+            h_ps[g] = args.host_problem_sizes[g];
 
-            h_ptr_A[g] = reinterpret_cast<const ElementA*>(input.data_ptr()) + off * K;
-            h_ptr_B[g] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(g) * N * K;
-            h_ptr_C[g] = reinterpret_cast<const ElementC*>(output.data_ptr()) + off * N;
-            h_ptr_D[g] = reinterpret_cast<ElementC*>(output.data_ptr()) + off * N;
+            h_pA[g] = reinterpret_cast<const ElementA*>(input.data_ptr()) + off * K;
+            h_pB[g] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(g) * N * K;
+            h_pC[g] = reinterpret_cast<const ElementC*>(output.data_ptr()) + off * N;
+            h_pD[g] = reinterpret_cast<ElementC*>(output.data_ptr()) + off * N;
 
-            h_stride_A[g] = cutlass::make_cute_packed_stride(StrideA{}, {M_g, K, 1});
-            h_stride_B[g] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-            h_stride_C[g] = cutlass::make_cute_packed_stride(StrideC{}, {M_g, N, 1});
-            h_stride_D[g] = cutlass::make_cute_packed_stride(StrideD{}, {M_g, N, 1});
+            h_sA[g] = cutlass::make_cute_packed_stride(StrideA{}, {M_g, K, 1});
+            h_sB[g] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+            h_sC[g] = cutlass::make_cute_packed_stride(StrideC{}, {M_g, N, 1});
+            h_sD[g] = cutlass::make_cute_packed_stride(StrideD{}, {M_g, N, 1});
+
             off += M_g;
         }
 
-        auto d = [&](const void* src, size_t bytes) -> torch::Tensor {
-            auto t = torch::empty({int64_t(bytes)},
-                torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
-            cudaMemcpyAsync(t.data_ptr(), src, bytes, cudaMemcpyHostToDevice, stream);
-            return t;
-        };
+        // Single device allocation + single H2D copy
+        args.packed_device_buf = torch::empty({static_cast<int64_t>(total_bytes)},
+            torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+        cudaMemcpyAsync(args.packed_device_buf.data_ptr(), host_buf.data(),
+                        total_bytes, cudaMemcpyHostToDevice, stream);
 
-        args.problem_sizes_device = d(args.host_problem_sizes.data(),
-            args.host_problem_sizes.size() * sizeof(UnderlyingProblemShape));
-        args.ptr_A_device = d(h_ptr_A.data(), h_ptr_A.size() * sizeof(const ElementA*));
-        args.ptr_B_device = d(h_ptr_B.data(), h_ptr_B.size() * sizeof(const ElementB*));
-        args.ptr_C_device = d(h_ptr_C.data(), h_ptr_C.size() * sizeof(const ElementC*));
-        args.ptr_D_device = d(h_ptr_D.data(), h_ptr_D.size() * sizeof(ElementC*));
-        args.stride_A_device = d(h_stride_A.data(), h_stride_A.size() * sizeof(StrideA));
-        args.stride_B_device = d(h_stride_B.data(), h_stride_B.size() * sizeof(StrideB));
-        args.stride_C_device = d(h_stride_C.data(), h_stride_C.size() * sizeof(StrideC));
-        args.stride_D_device = d(h_stride_D.data(), h_stride_D.size() * sizeof(StrideD));
         return args;
     }
 };
@@ -148,24 +182,24 @@ torch::Tensor launch_grouped_gemm(
     gemm_args = typename DeviceGemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {args.num_groups,
-         reinterpret_cast<UnderlyingProblemShape*>(args.problem_sizes_device.data_ptr()),
+         args.template dev_ptr<UnderlyingProblemShape>(args.off_problem_sizes),
          args.host_problem_sizes.data()},
-        {reinterpret_cast<const ElementA**>(args.ptr_A_device.data_ptr()),
-         reinterpret_cast<StrideA*>(args.stride_A_device.data_ptr()),
-         reinterpret_cast<const ElementB**>(args.ptr_B_device.data_ptr()),
-         reinterpret_cast<StrideB*>(args.stride_B_device.data_ptr())},
+        {args.template dev_ptr<const ElementA*>(args.off_ptr_A),
+         args.template dev_ptr<StrideA>(args.off_stride_A),
+         args.template dev_ptr<const ElementB*>(args.off_ptr_B),
+         args.template dev_ptr<StrideB>(args.off_stride_B)},
         {fusion_args,
-         reinterpret_cast<const ElementC**>(args.ptr_C_device.data_ptr()),
-         reinterpret_cast<StrideC*>(args.stride_C_device.data_ptr()),
-         reinterpret_cast<ElementC**>(args.ptr_D_device.data_ptr()),
-         reinterpret_cast<StrideD*>(args.stride_D_device.data_ptr())},
+         args.template dev_ptr<const ElementC*>(args.off_ptr_C),
+         args.template dev_ptr<StrideC>(args.off_stride_C),
+         args.template dev_ptr<ElementC*>(args.off_ptr_D),
+         args.template dev_ptr<StrideD>(args.off_stride_D)},
         hw_info
     };
 
     DeviceGemm gemm_op;
 
     size_t workspace_size = gemm_op.get_workspace_size(gemm_args);
-    auto workspace = torch::empty({int64_t(workspace_size)},
+    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
         torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
 
     cutlass::Status status = gemm_op.initialize(gemm_args, workspace.data_ptr(), stream);
@@ -180,27 +214,12 @@ torch::Tensor launch_grouped_gemm(
 }
 
 // ---------------------------------------------------------------------------
-// Auto tile selection: considers avg M, K, N to pick optimal config
+// Auto tile selection
 // ---------------------------------------------------------------------------
 
 static TileConfig auto_select_tile(
     const torch::Tensor& tokens_per_expert, int K, int N)
 {
-    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
-    int64_t num_groups = tokens_per_expert.size(0);
-    int64_t total = 0;
-    for (int64_t i = 0; i < num_groups; ++i) total += tpe[i];
-    int64_t avg_m = total / std::max(num_groups, int64_t(1));
-
-    // Empirically, Co_128x256x64 is the best for BF16/FP16 across most
-    // MoE workloads: wider N-tile maximizes GMMA utilization and the 64-deep
-    // K-tile keeps shared memory usage reasonable for multi-stage pipelining.
-    //
-    // Pingpong schedule is designed for FP8's higher compute density and
-    // does NOT outperform Cooperative for BF16/FP16 on H100.
-    //
-    // Fall back to 128x128x64 only when N is very small (< 256) where the
-    // 256-wide N-tile would waste compute on padding.
     if (N < 256) {
         return TileConfig::Co_128x128x64;
     }
@@ -208,7 +227,7 @@ static TileConfig auto_select_tile(
 }
 
 // ---------------------------------------------------------------------------
-// Public API: dtype × config dispatch
+// Public API
 // ---------------------------------------------------------------------------
 
 torch::Tensor grouped_gemm_forward(
