@@ -168,8 +168,8 @@ def verify_accuracy(
     if HAS_STANDARD_GMM:
         try:
             weights_kn = expert_weights.transpose(1, 2).contiguous()
-            tpe_gpu = tpe.to(device)
-            test_output = standard_gmm(input_tensor, weights_kn, tpe_gpu, trans_b=False)
+            tpe_cpu = tpe.cpu()
+            test_output = standard_gmm(input_tensor, weights_kn, tpe_cpu, trans_b=False)
             torch.cuda.synchronize()
 
             diff = (test_output.float() - ref_output.float()).abs()
@@ -321,13 +321,13 @@ def run_benchmark(
 
     # 4. Standard grouped_gemm (tgale96) — CUTLASS 2.x grouped kernel
     if HAS_STANDARD_GMM:
-        # standard gmm expects: a=[total_tokens, K], b=[E, K, N], batch_sizes on GPU
+        # standard gmm expects: a=[total_tokens, K], b=[E, K, N], batch_sizes CPU
         # with trans_b=False: computes a @ b, so b must be [E, K, N]
         weights_kn = expert_weights.transpose(1, 2).contiguous()  # [E, N, K] → [E, K, N]
-        tpe_gpu = tpe.to(device)
+        tpe_cpu = tpe.cpu()
         try:
             std_latency = benchmark_fn(
-                lambda: standard_gmm(input_tensor, weights_kn, tpe_gpu, trans_b=False))
+                lambda: standard_gmm(input_tensor, weights_kn, tpe_cpu, trans_b=False))
             std_tflops = total_flops / (std_latency * 1e-3) / 1e12
             results.append(BenchResult("Standard gmm", std_latency, std_tflops,
                                        dense_latency / std_latency))
