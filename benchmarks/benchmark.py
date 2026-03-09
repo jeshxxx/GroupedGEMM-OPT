@@ -246,8 +246,18 @@ class BenchResult:
     efficiency: float  # vs dense GEMM
 
 
-def benchmark_fn(fn, warmup: int = 10, repeat: int = 50) -> float:
+def _flush_l2():
+    """Flush GPU L2 cache by touching a large buffer."""
+    buf = torch.empty(40 * 1024 * 1024, dtype=torch.int8, device="cuda")  # 40MB > H100 L2
+    buf.zero_()
+    del buf
+    torch.cuda.synchronize()
+
+
+def benchmark_fn(fn, warmup: int = 20, repeat: int = 50, flush_l2: bool = True) -> float:
     """Returns median latency in milliseconds."""
+    if flush_l2:
+        _flush_l2()
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -335,28 +345,33 @@ def run_benchmark(
             results.append(BenchResult("Standard gmm", float('inf'), 0.0, 0.0))
             print(f"  WARNING: Standard gmm failed: {e}")
 
-    # 5. CUTLASS Persistent Grouped GEMM (opt) — all configs
+    # 5. CUTLASS Persistent Grouped GEMM (opt) — each config independently
     if HAS_CUTLASS_GROUPED:
+        # Determine which config Auto would select (for annotation only)
+        auto_output = grouped_gemm_opt(input_tensor, expert_weights, tpe,
+                                       TileConfig.AUTO, sort_by_m=False)
+        auto_pick = "Co_128x256x64" if N >= 256 else "Co_128x128x64"
+
         configs = [
-            ("Auto",           TileConfig.AUTO),
             ("Co 128x128x64",  TileConfig.Co_128x128x64),
             ("Co 128x256x64",  TileConfig.Co_128x256x64),
             ("PP 128x128x128", TileConfig.PP_128x128x128),
             ("PP 128x256x64",  TileConfig.PP_128x256x64),
         ]
         for tc_name, tc in configs:
+            suffix = " ★Auto" if tc_name.replace(" ", "_") == auto_pick else ""
             try:
                 cutlass_latency = benchmark_fn(
                     lambda tc=tc: grouped_gemm_opt(input_tensor, expert_weights, tpe, tc,
                                                    sort_by_m=False))
                 cutlass_tflops = total_flops / (cutlass_latency * 1e-3) / 1e12
                 results.append(BenchResult(
-                    f"CUTLASS ({tc_name})",
+                    f"CUTLASS ({tc_name}){suffix}",
                     cutlass_latency, cutlass_tflops,
                     dense_latency / cutlass_latency))
             except Exception as e:
                 results.append(BenchResult(
-                    f"CUTLASS ({tc_name})",
+                    f"CUTLASS ({tc_name}){suffix}",
                     float('inf'), 0.0, 0.0))
                 print(f"  WARNING: {tc_name} failed: {e}")
 
