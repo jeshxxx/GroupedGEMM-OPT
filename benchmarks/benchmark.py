@@ -19,12 +19,18 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from grouped_gemm import grouped_gemm, TileConfig
+    from grouped_gemm_opt import grouped_gemm_opt, TileConfig
     HAS_CUTLASS_GROUPED = True
 except ImportError:
     HAS_CUTLASS_GROUPED = False
-    print("WARNING: grouped_gemm not installed. Skipping CUTLASS benchmark.")
-    print("  Install with: cd /path/to/groupedgemm && pip install -e .")
+    print("WARNING: grouped_gemm_opt not installed. Skipping optimized CUTLASS benchmark.")
+    print("  Install with: cd /path/to/groupedgemm && pip install -e . --no-build-isolation")
+
+try:
+    from grouped_gemm.ops import gmm as standard_gmm
+    HAS_STANDARD_GMM = True
+except ImportError:
+    HAS_STANDARD_GMM = False
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +164,33 @@ def verify_accuracy(
     ref_output = sequential_gemm(input_tensor, expert_weights, tpe)
     torch.cuda.synchronize()
 
+    # Standard grouped_gemm accuracy
+    if HAS_STANDARD_GMM:
+        try:
+            weights_kn = expert_weights.transpose(1, 2).contiguous()
+            tpe_gpu = tpe.to(device)
+            test_output = standard_gmm(input_tensor, weights_kn, tpe_gpu, trans_b=False)
+            torch.cuda.synchronize()
+
+            diff = (test_output.float() - ref_output.float()).abs()
+            ref_abs = ref_output.float().abs().clamp(min=1e-6)
+            max_abs = diff.max().item()
+            mean_abs = diff.mean().item()
+            max_rel = (diff / ref_abs).max().item()
+            flat_test = test_output.float().flatten()
+            flat_ref = ref_output.float().flatten()
+            cos = torch.nn.functional.cosine_similarity(
+                flat_test.unsqueeze(0), flat_ref.unsqueeze(0)).item()
+            atol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+            passed = torch.allclose(test_output.float(), ref_output.float(),
+                                    atol=atol, rtol=1e-2)
+            results.append(AccuracyResult("Standard gmm", max_abs, mean_abs,
+                                          max_rel, cos, passed))
+        except Exception as e:
+            results.append(AccuracyResult("Standard gmm", float('inf'), float('inf'),
+                                          float('inf'), 0.0, False))
+            print(f"  WARNING: Standard gmm accuracy check failed: {e}")
+
     if not HAS_CUTLASS_GROUPED:
         return results
 
@@ -170,8 +203,8 @@ def verify_accuracy(
 
     for tc_name, tc in configs:
         try:
-            test_output = grouped_gemm(input_tensor, expert_weights, tpe, tc,
-                                       sort_by_m=False)
+            test_output = grouped_gemm_opt(input_tensor, expert_weights, tpe, tc,
+                                           sort_by_m=False)
             torch.cuda.synchronize()
 
             diff = (test_output.float() - ref_output.float()).abs()
@@ -286,7 +319,23 @@ def run_benchmark(
     results.append(BenchResult("Batched cuBLAS (pad)", batch_latency, batch_tflops,
                                dense_latency / batch_latency))
 
-    # 4. CUTLASS Persistent Grouped GEMM — all configs
+    # 4. Standard grouped_gemm (tgale96) — CUTLASS 2.x grouped kernel
+    if HAS_STANDARD_GMM:
+        # standard gmm expects: a=[total_tokens, K], b=[E, K, N], batch_sizes on GPU
+        # with trans_b=False: computes a @ b, so b must be [E, K, N]
+        weights_kn = expert_weights.transpose(1, 2).contiguous()  # [E, N, K] → [E, K, N]
+        tpe_gpu = tpe.to(device)
+        try:
+            std_latency = benchmark_fn(
+                lambda: standard_gmm(input_tensor, weights_kn, tpe_gpu, trans_b=False))
+            std_tflops = total_flops / (std_latency * 1e-3) / 1e12
+            results.append(BenchResult("Standard gmm", std_latency, std_tflops,
+                                       dense_latency / std_latency))
+        except Exception as e:
+            results.append(BenchResult("Standard gmm", float('inf'), 0.0, 0.0))
+            print(f"  WARNING: Standard gmm failed: {e}")
+
+    # 5. CUTLASS Persistent Grouped GEMM (opt) — all configs
     if HAS_CUTLASS_GROUPED:
         configs = [
             ("Auto",           TileConfig.AUTO),
@@ -298,8 +347,8 @@ def run_benchmark(
         for tc_name, tc in configs:
             try:
                 cutlass_latency = benchmark_fn(
-                    lambda tc=tc: grouped_gemm(input_tensor, expert_weights, tpe, tc,
-                                               sort_by_m=False))
+                    lambda tc=tc: grouped_gemm_opt(input_tensor, expert_weights, tpe, tc,
+                                                   sort_by_m=False))
                 cutlass_tflops = total_flops / (cutlass_latency * 1e-3) / 1e12
                 results.append(BenchResult(
                     f"CUTLASS ({tc_name})",

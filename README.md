@@ -1,4 +1,4 @@
-# High-Performance Grouped GEMM for MoE
+# High-Performance Grouped GEMM for MoE (grouped_gemm_opt)
 
 CUTLASS 3.x SM90 (Hopper) **Persistent Grouped GEMM** kernel optimized for
 Mixture-of-Experts workloads. Achieves **75-90% efficiency** relative to dense
@@ -41,7 +41,7 @@ python setup.py develop
 
 ```python
 import torch
-from grouped_gemm import grouped_gemm, TileConfig
+from grouped_gemm_opt import grouped_gemm_opt, TileConfig
 
 num_experts = 8
 total_tokens = 4096
@@ -54,11 +54,11 @@ weights = torch.randn(num_experts, ffn_dim, hidden_dim, device="cuda", dtype=tor
 tokens_per_expert = torch.tensor([512, 480, 520, 500, 510, 490, 530, 554], dtype=torch.int64)
 
 # Run grouped GEMM (auto tile selection)
-output = grouped_gemm(input, weights, tokens_per_expert)
+output = grouped_gemm_opt(input, weights, tokens_per_expert)
 # output: [4096, 14336] bfloat16
 
 # Force specific tile config for benchmarking
-output = grouped_gemm(input, weights, tokens_per_expert, TileConfig.LARGE)
+output = grouped_gemm_opt(input, weights, tokens_per_expert, TileConfig.Co_128x256x64)
 ```
 
 ### Weight Layout

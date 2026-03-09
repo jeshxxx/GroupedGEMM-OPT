@@ -15,8 +15,8 @@ torch::Tensor grouped_gemm_forward_wrapper(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("grouped_gemm_forward", &grouped_gemm_forward_wrapper,
-        "CUTLASS 3.x SM90 Persistent Grouped GEMM for MoE",
+    m.def("grouped_gemm_opt_forward", &grouped_gemm_forward_wrapper,
+        "CUTLASS 3.x SM90 Persistent Grouped GEMM for MoE (optimized)",
         py::arg("input"),
         py::arg("weights"),
         py::arg("tokens_per_expert"),

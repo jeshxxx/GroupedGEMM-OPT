@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from grouped_gemm._C import grouped_gemm_forward
+from grouped_gemm_opt._C import grouped_gemm_opt_forward
 
 
 class TileConfig(IntEnum):
@@ -13,8 +13,8 @@ class TileConfig(IntEnum):
       Co_128x128x64  — baseline, good for small avg M
       Co_128x256x64  — wider N tile
 
-    Pingpong schedule (faster pipeline, ~10-15% over Cooperative):
-      PP_128x128x128 — deep K tile + Cluster 2x1x1, best for large K
+    Pingpong schedule (for FP8; not recommended for BF16/FP16):
+      PP_128x128x128 — deep K tile + Cluster 2x1x1
       PP_128x256x64  — wide N tile with Pingpong
 
     Auto: selects best based on K, N, avg tokens/expert
@@ -26,14 +26,14 @@ class TileConfig(IntEnum):
     AUTO           = 4
 
 
-def grouped_gemm(
+def grouped_gemm_opt(
     input: torch.Tensor,
     weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     tile_config: TileConfig = TileConfig.AUTO,
     sort_by_m: bool = True,
 ) -> torch.Tensor:
-    """MoE Grouped GEMM using CUTLASS 3.x SM90 Persistent Kernel.
+    """MoE Grouped GEMM using CUTLASS 3.x SM90 Persistent Kernel (optimized).
 
     Computes: output[i] = input[i] @ weights[expert_of(i)].T
 
@@ -64,7 +64,7 @@ def grouped_gemm(
         input, weights, tokens_per_expert = _sort_by_descending_m(
             input, weights, tokens_per_expert)
 
-    return grouped_gemm_forward(
+    return grouped_gemm_opt_forward(
         input.contiguous(),
         weights.contiguous(),
         tokens_per_expert,
@@ -77,13 +77,7 @@ def _sort_by_descending_m(
     weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
 ):
-    """Sort experts by descending token count for better load balance.
-
-    Reorders input segments and weight pointers so the persistent tile
-    scheduler processes large experts first, reducing tail effects.
-
-    Uses vectorized ops on GPU — no Python loops in the hot path.
-    """
+    """Sort experts by descending token count for better load balance."""
     sorted_indices = torch.argsort(tokens_per_expert, descending=True)
 
     if torch.equal(sorted_indices, torch.arange(len(sorted_indices))):

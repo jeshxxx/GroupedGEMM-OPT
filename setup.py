@@ -56,7 +56,7 @@ nvcc_flags = [
 
 ext_modules = [
     CUDAExtension(
-        name="grouped_gemm._C",
+        name="grouped_gemm_opt._C",
         sources=[
             "csrc/grouped_gemm_kernel.cu",
             "csrc/torch_ext.cpp",
@@ -74,7 +74,7 @@ ext_modules = [
 ]
 
 setup(
-    name="grouped_gemm",
+    name="grouped_gemm_opt",
     version="0.1.0",
     description="High-performance Grouped GEMM for MoE using CUTLASS 3.x Persistent Kernels",
     packages=find_packages(),
