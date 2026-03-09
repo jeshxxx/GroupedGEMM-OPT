@@ -31,6 +31,22 @@ python3 benchmarks/benchmark.py \
     --dtype=bf16 --distributions=random
 
 echo ""
+echo ">>> Test 4/5: 64 experts, small M/expert (persistent advantage)"
+echo ""
+python3 benchmarks/benchmark.py \
+    --total-tokens=4096 --num-experts=64 \
+    --hidden-dim=4096 --ffn-dim=4096 \
+    --dtype=bf16 --distributions=random
+
+echo ""
+echo ">>> Test 5/5: 128 experts, very small M/expert (persistent advantage)"
+echo ""
+python3 benchmarks/benchmark.py \
+    --total-tokens=4096 --num-experts=128 \
+    --hidden-dim=4096 --ffn-dim=4096 \
+    --dtype=bf16 --distributions=random
+
+echo ""
 echo "============================================================"
 echo " All benchmarks complete."
 echo "============================================================"

@@ -89,18 +89,24 @@ struct GroupedGemmArgs {
         args.off_stride_D = cursor;      cursor += align_up(sz_sD);
         size_t total_bytes = cursor;
 
-        // Build everything in one host buffer
-        std::vector<char> host_buf(total_bytes, 0);
+        // Pinned host buffer: makes cudaMemcpyAsync truly asynchronous
+        // (pageable memory silently falls back to synchronous copy)
+        char* host_buf_raw = nullptr;
+        cudaMallocHost(&host_buf_raw, total_bytes);
+        std::memset(host_buf_raw, 0, total_bytes);
+        // Wrap in unique_ptr for RAII cleanup
+        auto host_buf_deleter = [](char* p) { if (p) cudaFreeHost(p); };
+        std::unique_ptr<char, decltype(host_buf_deleter)> host_buf_owner(host_buf_raw, host_buf_deleter);
 
-        auto* h_ps = reinterpret_cast<UnderlyingProblemShape*>(host_buf.data() + args.off_problem_sizes);
-        auto* h_pA = reinterpret_cast<const ElementA**>(host_buf.data() + args.off_ptr_A);
-        auto* h_pB = reinterpret_cast<const ElementB**>(host_buf.data() + args.off_ptr_B);
-        auto* h_pC = reinterpret_cast<const ElementC**>(host_buf.data() + args.off_ptr_C);
-        auto* h_pD = reinterpret_cast<ElementC**>(host_buf.data() + args.off_ptr_D);
-        auto* h_sA = reinterpret_cast<StrideA*>(host_buf.data() + args.off_stride_A);
-        auto* h_sB = reinterpret_cast<StrideB*>(host_buf.data() + args.off_stride_B);
-        auto* h_sC = reinterpret_cast<StrideC*>(host_buf.data() + args.off_stride_C);
-        auto* h_sD = reinterpret_cast<StrideD*>(host_buf.data() + args.off_stride_D);
+        auto* h_ps = reinterpret_cast<UnderlyingProblemShape*>(host_buf_raw + args.off_problem_sizes);
+        auto* h_pA = reinterpret_cast<const ElementA**>(host_buf_raw + args.off_ptr_A);
+        auto* h_pB = reinterpret_cast<const ElementB**>(host_buf_raw + args.off_ptr_B);
+        auto* h_pC = reinterpret_cast<const ElementC**>(host_buf_raw + args.off_ptr_C);
+        auto* h_pD = reinterpret_cast<ElementC**>(host_buf_raw + args.off_ptr_D);
+        auto* h_sA = reinterpret_cast<StrideA*>(host_buf_raw + args.off_stride_A);
+        auto* h_sB = reinterpret_cast<StrideB*>(host_buf_raw + args.off_stride_B);
+        auto* h_sC = reinterpret_cast<StrideC*>(host_buf_raw + args.off_stride_C);
+        auto* h_sD = reinterpret_cast<StrideD*>(host_buf_raw + args.off_stride_D);
 
         const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
         int64_t off = 0;
@@ -126,7 +132,7 @@ struct GroupedGemmArgs {
         // Single device allocation + single H2D copy
         args.packed_device_buf = torch::empty({static_cast<int64_t>(total_bytes)},
             torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
-        cudaMemcpyAsync(args.packed_device_buf.data_ptr(), host_buf.data(),
+        cudaMemcpyAsync(args.packed_device_buf.data_ptr(), host_buf_raw,
                         total_bytes, cudaMemcpyHostToDevice, stream);
 
         return args;
@@ -136,6 +142,37 @@ struct GroupedGemmArgs {
 // ---------------------------------------------------------------------------
 // Templated launch
 // ---------------------------------------------------------------------------
+
+// Per-kernel-type cached state to avoid repeated allocations and driver queries
+template <typename KernelType>
+struct KernelCache {
+    static int sm_count;
+    static size_t workspace_capacity;
+    static torch::Tensor workspace;
+    static bool initialized;
+
+    static void ensure_init(int device_id, torch::Device device) {
+        if (!initialized) {
+            sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+            workspace_capacity = 0;
+            initialized = true;
+        }
+    }
+
+    static void* get_workspace(size_t needed, torch::Device device) {
+        if (needed > workspace_capacity) {
+            workspace = torch::empty({static_cast<int64_t>(std::max(needed, size_t(1)))},
+                torch::TensorOptions().dtype(torch::kUInt8).device(device));
+            workspace_capacity = needed;
+        }
+        return workspace.data_ptr();
+    }
+};
+
+template <typename KT> int KernelCache<KT>::sm_count = 0;
+template <typename KT> size_t KernelCache<KT>::workspace_capacity = 0;
+template <typename KT> torch::Tensor KernelCache<KT>::workspace;
+template <typename KT> bool KernelCache<KT>::initialized = false;
 
 template <typename KernelType>
 torch::Tensor launch_grouped_gemm(
@@ -153,9 +190,13 @@ torch::Tensor launch_grouped_gemm(
     using StrideC     = typename KernelType::StrideC;
     using StrideD     = typename KernelType::StrideD;
     using UnderlyingProblemShape = typename KernelType::ProblemShape::UnderlyingProblemShape;
+    using Cache = KernelCache<KernelType>;
 
     const int total_tokens = input.size(0);
     const int N = weights.size(1);
+    const int device_id = input.device().index();
+
+    Cache::ensure_init(device_id, input.device());
 
     auto output = torch::empty({total_tokens, N},
         torch::TensorOptions().dtype(input.dtype()).device(input.device()));
@@ -163,10 +204,7 @@ torch::Tensor launch_grouped_gemm(
     auto args = GroupedGemmArgs<KernelType>::prepare(
         input, weights, output, tokens_per_expert, stream);
 
-    cutlass::KernelHardwareInfo hw_info{};
-    hw_info.device_id = input.device().index();
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(
-        hw_info.device_id);
+    cutlass::KernelHardwareInfo hw_info{device_id, Cache::sm_count};
 
     typename DeviceGemm::Arguments gemm_args;
     decltype(gemm_args.epilogue.thread) fusion_args{};
@@ -198,11 +236,10 @@ torch::Tensor launch_grouped_gemm(
 
     DeviceGemm gemm_op;
 
-    size_t workspace_size = gemm_op.get_workspace_size(gemm_args);
-    auto workspace = torch::empty({static_cast<int64_t>(workspace_size)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(input.device()));
+    size_t ws_size = gemm_op.get_workspace_size(gemm_args);
+    void* ws_ptr = Cache::get_workspace(ws_size, input.device());
 
-    cutlass::Status status = gemm_op.initialize(gemm_args, workspace.data_ptr(), stream);
+    cutlass::Status status = gemm_op.initialize(gemm_args, ws_ptr, stream);
     TORCH_CHECK(status == cutlass::Status::kSuccess,
         "CUTLASS grouped GEMM initialize failed: ", cutlassGetStatusString(status));
 
