@@ -263,23 +263,9 @@ torch::Tensor launch_grouped_gemm(
 static TileConfig auto_select_tile(
     const torch::Tensor& tokens_per_expert, int K, int N)
 {
-    const int G = tokens_per_expert.size(0);
-    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
-    int64_t total_tokens = 0;
-    for (int g = 0; g < G; ++g) total_tokens += tpe[g];
-    int avg_m = G > 0 ? static_cast<int>(total_tokens / G) : 0;
-
-    // For small N, narrower tile avoids waste
     if (N < 256) {
         return TileConfig::Co_128x128x64;
     }
-
-    // For large avg M/expert, Co_128x128x64 has lower per-tile overhead
-    // and more tiles → better persistent scheduler utilization
-    if (avg_m >= 4096 && N <= 2048) {
-        return TileConfig::Co_128x128x64;
-    }
-
     return TileConfig::Co_128x256x64;
 }
 
