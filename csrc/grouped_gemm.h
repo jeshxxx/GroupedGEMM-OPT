@@ -20,6 +20,7 @@ torch::Tensor grouped_gemm_forward(
     const torch::Tensor& input,
     const torch::Tensor& weights,
     const torch::Tensor& tokens_per_expert,
-    TileConfig tile_config = TileConfig::Auto);
+    TileConfig tile_config = TileConfig::Auto,
+    bool sort_by_m = true);
 
 }  // namespace grouped_gemm

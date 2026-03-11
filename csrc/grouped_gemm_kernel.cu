@@ -8,7 +8,9 @@
 #include <torch/torch.h>
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <vector>
 
 namespace grouped_gemm {
@@ -66,7 +68,8 @@ struct GroupedGemmArgs {
         const torch::Tensor& weights,
         torch::Tensor& output,
         const torch::Tensor& tokens_per_expert,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        bool sort_by_m)
     {
         GroupedGemmArgs args;
         args.num_groups = tokens_per_expert.size(0);
@@ -110,22 +113,43 @@ struct GroupedGemmArgs {
         auto* h_sD = reinterpret_cast<StrideD*>(host_buf.data() + args.off_stride_D);
 
         const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
+
+        // Build group ordering: optionally sort by descending M for better
+        // persistent scheduler load balance. Only reorders pointer/stride
+        // arrays — zero data movement cost.
+        std::vector<int> order(G);
+        std::iota(order.begin(), order.end(), 0);
+        if (sort_by_m && G > 1) {
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return tpe[a] > tpe[b];
+            });
+        }
+
+        // Precompute per-expert input/output offsets in original order
+        std::vector<int64_t> offsets(G);
         int64_t off = 0;
-
         for (int g = 0; g < G; ++g) {
+            offsets[g] = off;
+            off += tpe[g];
+        }
+
+        // Populate arrays in (potentially sorted) order
+        for (int i = 0; i < G; ++i) {
+            int g = order[i];
             int M_g = static_cast<int>(tpe[g]);
-            args.host_problem_sizes[g] = cute::make_shape(M_g, N, K);
+            int64_t a_off = offsets[g];
 
-            h_pA[g] = reinterpret_cast<const ElementA*>(input.data_ptr()) + off * K;
-            h_pB[g] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(g) * N * K;
-            h_pC[g] = reinterpret_cast<const ElementC*>(output.data_ptr()) + off * N;
-            h_pD[g] = reinterpret_cast<ElementC*>(output.data_ptr()) + off * N;
+            args.host_problem_sizes[i] = cute::make_shape(M_g, N, K);
 
-            h_sA[g] = cutlass::make_cute_packed_stride(StrideA{}, {M_g, K, 1});
-            h_sB[g] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
-            h_sC[g] = cutlass::make_cute_packed_stride(StrideC{}, {M_g, N, 1});
-            h_sD[g] = cutlass::make_cute_packed_stride(StrideD{}, {M_g, N, 1});
-            off += M_g;
+            h_pA[i] = reinterpret_cast<const ElementA*>(input.data_ptr()) + a_off * K;
+            h_pB[i] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(g) * N * K;
+            h_pC[i] = reinterpret_cast<const ElementC*>(output.data_ptr()) + a_off * N;
+            h_pD[i] = reinterpret_cast<ElementC*>(output.data_ptr()) + a_off * N;
+
+            h_sA[i] = cutlass::make_cute_packed_stride(StrideA{}, {M_g, K, 1});
+            h_sB[i] = cutlass::make_cute_packed_stride(StrideB{}, {N, K, 1});
+            h_sC[i] = cutlass::make_cute_packed_stride(StrideC{}, {M_g, N, 1});
+            h_sD[i] = cutlass::make_cute_packed_stride(StrideD{}, {M_g, N, 1});
         }
 
         // Copy problem sizes into the staging buffer too
@@ -152,7 +176,8 @@ torch::Tensor launch_grouped_gemm(
     const torch::Tensor& input,
     const torch::Tensor& weights,
     const torch::Tensor& tokens_per_expert,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool sort_by_m)
 {
     using DeviceGemm  = typename KernelType::DeviceGemm;
     using ElementA    = typename KernelType::ElementA;
@@ -171,7 +196,7 @@ torch::Tensor launch_grouped_gemm(
         torch::TensorOptions().dtype(input.dtype()).device(input.device()));
 
     auto args = GroupedGemmArgs<KernelType>::prepare(
-        input, weights, output, tokens_per_expert, stream);
+        input, weights, output, tokens_per_expert, stream, sort_by_m);
 
     cutlass::KernelHardwareInfo hw_info{};
     hw_info.device_id = input.device().index();
@@ -266,7 +291,8 @@ torch::Tensor grouped_gemm_forward(
     const torch::Tensor& input,
     const torch::Tensor& weights,
     const torch::Tensor& tokens_per_expert,
-    TileConfig tile_config)
+    TileConfig tile_config,
+    bool sort_by_m)
 {
     TORCH_CHECK(input.is_cuda(), "input must be on CUDA");
     TORCH_CHECK(weights.is_cuda(), "weights must be on CUDA");
@@ -290,26 +316,26 @@ torch::Tensor grouped_gemm_forward(
     if (input.scalar_type() == torch::kBFloat16) {
         switch (tile_config) {
             case TileConfig::Co_128x128x64:
-                return launch_grouped_gemm<BF16_128x128x64_Co>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<BF16_128x128x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::Co_128x256x64:
-                return launch_grouped_gemm<BF16_128x256x64_Co>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<BF16_128x256x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::PP_128x128x128:
-                return launch_grouped_gemm<BF16_128x128x128_PP>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<BF16_128x128x128_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::PP_128x256x64:
-                return launch_grouped_gemm<BF16_128x256x64_PP>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<BF16_128x256x64_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
             default:
                 TORCH_CHECK(false, "Invalid tile config");
         }
     } else if (input.scalar_type() == torch::kHalf) {
         switch (tile_config) {
             case TileConfig::Co_128x128x64:
-                return launch_grouped_gemm<F16_128x128x64_Co>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<F16_128x128x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::Co_128x256x64:
-                return launch_grouped_gemm<F16_128x256x64_Co>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<F16_128x256x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::PP_128x128x128:
-                return launch_grouped_gemm<F16_128x128x128_PP>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<F16_128x128x128_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
             case TileConfig::PP_128x256x64:
-                return launch_grouped_gemm<F16_128x256x64_PP>(input, weights, tokens_per_expert, stream);
+                return launch_grouped_gemm<F16_128x256x64_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
             default:
                 TORCH_CHECK(false, "Invalid tile config");
         }

@@ -7,11 +7,13 @@ torch::Tensor grouped_gemm_forward_wrapper(
     const torch::Tensor& input,
     const torch::Tensor& weights,
     const torch::Tensor& tokens_per_expert,
-    int64_t tile_config)
+    int64_t tile_config,
+    bool sort_by_m)
 {
     return grouped_gemm_forward(
         input, weights, tokens_per_expert,
-        static_cast<TileConfig>(tile_config));
+        static_cast<TileConfig>(tile_config),
+        sort_by_m);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -20,5 +22,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("input"),
         py::arg("weights"),
         py::arg("tokens_per_expert"),
-        py::arg("tile_config") = 4  /* Auto */);
+        py::arg("tile_config") = 4  /* Auto */,
+        py::arg("sort_by_m") = true);
 }

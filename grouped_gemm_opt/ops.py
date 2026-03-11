@@ -1,5 +1,4 @@
 from enum import IntEnum
-from typing import Optional
 
 import torch
 
@@ -42,8 +41,9 @@ def grouped_gemm_opt(
         weights: [num_experts, N, K] — expert weights, same shape as torch.nn.Linear (out_features, in_features).
         tokens_per_expert: [num_experts] int64 tensor.
         tile_config: Kernel configuration. AUTO recommended.
-        sort_by_m: Sort experts by descending token count before dispatch.
-                   Improves persistent kernel load balance by ~2-5%.
+        sort_by_m: Sort groups by descending token count before dispatch.
+                   Zero-cost: only reorders pointer/stride arrays in C++,
+                   no data movement. Improves persistent kernel load balance.
 
     Returns:
         output: [total_tokens, N]
@@ -72,43 +72,10 @@ def grouped_gemm_opt(
         return torch.empty(0, weights.size(1) if weights.dim() == 3 else 0,
                            device=input.device, dtype=input.dtype)
 
-    if sort_by_m and tokens_per_expert.size(0) > 1:
-        input, weights, tokens_per_expert = _sort_by_descending_m(
-            input, weights, tokens_per_expert)
-
     return grouped_gemm_opt_forward(
         input.contiguous(),
         weights.contiguous(),
         tokens_per_expert,
         int(tile_config),
+        sort_by_m,
     )
-
-
-def _sort_by_descending_m(
-    input: torch.Tensor,
-    weights: torch.Tensor,
-    tokens_per_expert: torch.Tensor,
-):
-    """Sort experts by descending token count for better load balance."""
-    sorted_indices = torch.argsort(tokens_per_expert, descending=True)
-
-    if torch.equal(sorted_indices, torch.arange(len(sorted_indices))):
-        return input, weights, tokens_per_expert
-
-    tpe_sorted = tokens_per_expert[sorted_indices]
-    weights_sorted = weights[sorted_indices]
-
-    offsets = torch.zeros(len(tokens_per_expert) + 1, dtype=torch.int64)
-    torch.cumsum(tokens_per_expert, 0, out=offsets[1:])
-
-    lengths = tpe_sorted.tolist()
-    starts = [offsets[idx].item() for idx in sorted_indices.tolist()]
-
-    parts = []
-    for s, l in zip(starts, lengths):
-        if l > 0:
-            parts.append(torch.arange(s, s + l, device=input.device))
-    gather_idx = torch.cat(parts)
-
-    input_sorted = input[gather_idx]
-    return input_sorted, weights_sorted, tpe_sorted
