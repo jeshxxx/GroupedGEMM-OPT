@@ -1,11 +1,11 @@
 """
 Triton Fused MoE GEMM kernel — zero tile-padding, per-token expert dispatch.
 
-Tokens are pre-sorted by expert_id. Within each tile, uses the first token's
-expert_id for the B (weight) load — correct when all tokens in a tile share
-the same expert, which is true for most tiles after sorting.
+Tokens are pre-sorted by expert_id. Each tile may span multiple experts.
+For each expert present in a tile, the kernel masks the relevant rows,
+loads that expert's weight, and accumulates via tl.dot.
 
-Reference: vLLM fused_moe kernel (simplified for benchmark comparison).
+This is correct for any token distribution and number of experts.
 """
 
 import torch
@@ -15,85 +15,90 @@ import triton.language as tl
 
 @triton.jit
 def _fused_moe_kernel(
-    A_ptr,            # [total_tokens, K]
-    B_ptr,            # [num_experts, N, K]
-    C_ptr,            # [total_tokens, N]
-    sorted_ids_ptr,   # [total_tokens] int32
-    expert_ids_ptr,   # [total_tokens] int32
-    total_tokens,     # actual token count (NOT padded)
-    N,
-    K,
-    stride_an,        # A stride along M (= K)
-    stride_ak,        # A stride along K (= 1)
-    stride_be,        # B stride between experts (= N * K)
-    stride_bn,        # B stride along N (= K)
-    stride_bk,        # B stride along K (= 1)
-    stride_cn,        # C stride along M (= N)
-    stride_ck,        # C stride along N (= 1)
+    A_ptr, B_ptr, C_ptr,
+    sorted_ids_ptr,   # [total_tokens] int32 — gather indices for A/C
+    expert_ids_ptr,   # [total_tokens] int32 — expert_id per sorted position
+    offsets_ptr,       # [num_experts + 1] int32 — cumulative token offsets per expert
+    total_tokens,
+    N, K,
+    stride_an, stride_ak,
+    stride_be, stride_bn, stride_bk,
+    stride_cn, stride_ck,
+    num_experts,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    MAX_EXPERTS_PER_TILE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    m_range = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    tile_start = pid_m * BLOCK_M
+    m_range = tile_start + tl.arange(0, BLOCK_M)
     m_mask = m_range < total_tokens
 
-    # Load sorted token indices (for A/C gather/scatter)
     token_ids = tl.load(sorted_ids_ptr + m_range, mask=m_mask, other=0)
-
-    # Use the first valid token's expert_id for the entire tile's B load.
-    # This is correct when all tokens in the tile share one expert (most tiles).
-    first_valid = pid_m * BLOCK_M
-    first_valid = tl.minimum(first_valid, total_tokens - 1)
-    expert = tl.load(expert_ids_ptr + first_valid)
+    row_expert = tl.load(expert_ids_ptr + m_range, mask=m_mask, other=-1)
 
     n_range = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = n_range < N
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
-    for k_start in range(0, K, BLOCK_K):
-        k_range = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_range < K
+    # Find the range of experts in this tile
+    first_expert = tl.load(expert_ids_ptr + tl.minimum(tile_start, total_tokens - 1))
+    last_idx = tl.minimum(tile_start + BLOCK_M - 1, total_tokens - 1)
+    last_expert = tl.load(expert_ids_ptr + last_idx)
 
-        # A[token_ids, k_range]: gather rows by token_id
-        a = tl.load(A_ptr + token_ids[:, None] * stride_an + k_range[None, :] * stride_ak,
-                     mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+    # Iterate over experts present in this tile (sorted → contiguous)
+    for g in tl.static_range(MAX_EXPERTS_PER_TILE):
+        e = first_expert + g
+        still_active = e <= last_expert
+        # Mask: rows belonging to expert e
+        mask_e = (row_expert == e) & m_mask
 
-        # B[expert, k_range, n_range]: same expert for all rows in tile
-        # B is stored as [num_experts, N, K], so B[e, n, k] = B_ptr + e*stride_be + n*stride_bn + k*stride_bk
-        # For tl.dot(a[M,K], b[K,N]), b must be [BLOCK_K, BLOCK_N]
-        b = tl.load(B_ptr + expert * stride_be + k_range[:, None] * stride_bk + n_range[None, :] * stride_bn,
-                     mask=k_mask[:, None] & n_mask[None, :], other=0.0)
+        for k_start in range(0, K, BLOCK_K):
+            k_range = k_start + tl.arange(0, BLOCK_K)
+            k_mask = k_range < K
 
-        acc += tl.dot(a, b)
+            # Load A: gather by token_id, zero out rows not belonging to expert e
+            a = tl.load(A_ptr + token_ids[:, None] * stride_an + k_range[None, :] * stride_ak,
+                         mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+            a = tl.where(mask_e[:, None] & still_active, a, 0.0)
 
-    # C[token_ids, n_range]: scatter rows by token_id
+            # Load B[e]: transposed view [K, N] for tl.dot
+            b = tl.load(B_ptr + e * stride_be + k_range[:, None] * stride_bk + n_range[None, :] * stride_bn,
+                         mask=k_mask[:, None] & n_mask[None, :] & still_active, other=0.0)
+
+            acc += tl.dot(a, b)
+
+    # Store C: scatter by token_id
     tl.store(C_ptr + token_ids[:, None] * stride_cn + n_range[None, :] * stride_ck,
              acc.to(C_ptr.dtype.element_ty),
              mask=m_mask[:, None] & n_mask[None, :])
 
 
-def _sort_tokens_by_expert(tokens_per_expert: torch.Tensor, device: torch.device):
-    """Create sorted token indices and per-position expert IDs."""
+def _prepare_expert_mapping(tokens_per_expert: torch.Tensor, device: torch.device):
+    """Build sorted token indices, per-position expert IDs, and cumulative offsets."""
     num_experts = tokens_per_expert.size(0)
     total_tokens = int(tokens_per_expert.sum().item())
 
     sorted_ids = torch.empty(total_tokens, dtype=torch.int32, device=device)
     expert_ids = torch.empty(total_tokens, dtype=torch.int32, device=device)
 
+    offsets = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
     offset = 0
     for e in range(num_experts):
         m = int(tokens_per_expert[e].item())
+        offsets[e] = offset
         if m > 0:
             sorted_ids[offset:offset + m] = torch.arange(
                 offset, offset + m, dtype=torch.int32, device=device)
             expert_ids[offset:offset + m] = e
-            offset += m
+        offset += m
+    offsets[num_experts] = offset
 
-    return sorted_ids, expert_ids
+    return sorted_ids, expert_ids, offsets
 
 
 def triton_fused_moe(
@@ -104,9 +109,10 @@ def triton_fused_moe(
     BLOCK_N: int = 128,
     BLOCK_K: int = 64,
 ) -> torch.Tensor:
-    """Triton Fused MoE GEMM — zero padding waste."""
+    """Triton Fused MoE GEMM — zero padding, handles multi-expert tiles correctly."""
     total_tokens = input.size(0)
     K = input.size(1)
+    num_experts = weights.size(0)
     N = weights.size(1)
 
     if total_tokens == 0:
@@ -117,21 +123,34 @@ def triton_fused_moe(
     if tokens_per_expert.is_cuda:
         tokens_per_expert = tokens_per_expert.cpu()
 
-    sorted_ids, expert_ids = _sort_tokens_by_expert(tokens_per_expert, input.device)
+    sorted_ids, expert_ids, offsets = _prepare_expert_mapping(
+        tokens_per_expert, input.device)
+
+    # Max experts a single tile can span: ceil(BLOCK_M / min_nonzero_tokens) + 1
+    nonzero_tpe = tokens_per_expert[tokens_per_expert > 0]
+    if len(nonzero_tpe) > 0:
+        min_tpe = int(nonzero_tpe.min().item())
+        max_experts_per_tile = min((BLOCK_M // max(min_tpe, 1)) + 2, num_experts)
+    else:
+        max_experts_per_tile = 1
+    # Clamp to reasonable compile-time values (Triton compiles per unique value)
+    max_experts_per_tile = min(max(max_experts_per_tile, 1), 64)
 
     grid = (triton.cdiv(total_tokens, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _fused_moe_kernel[grid](
         input, weights, output,
-        sorted_ids, expert_ids,
+        sorted_ids, expert_ids, offsets,
         total_tokens,
         N, K,
         input.stride(0), input.stride(1),
         weights.stride(0), weights.stride(1), weights.stride(2),
         output.stride(0), output.stride(1),
+        num_experts,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        MAX_EXPERTS_PER_TILE=max_experts_per_tile,
     )
 
     return output
