@@ -378,7 +378,7 @@ def run_benchmark(
                 lambda: grouped_gemm_opt(input_tensor, expert_weights, tpe,
                                          TileConfig.AUTO, sort_by_m=False))
             auto_tflops = total_flops / (auto_latency * 1e-3) / 1e12
-            auto_backend = "cuBLAS" if avg_m >= 2048 else "CUTLASS"
+            auto_backend = "cuBLASLt" if avg_m >= 3072 else "CUTLASS"
             results.append(BenchResult(
                 f"Ours Auto ({auto_backend})",
                 auto_latency, auto_tflops,

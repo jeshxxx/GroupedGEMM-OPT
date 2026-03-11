@@ -65,7 +65,7 @@ def main():
     print("=" * 120)
     print(f"Standard gmm vs Ours (Auto)  |  GPU: {torch.cuda.get_device_name(0)}")
     print(f"num_experts={num_experts}, dtype=bf16, distribution=random")
-    print(f"Auto strategy: CUTLASS (small M/E) ↔ cuBLAS-seq (large M/E), threshold=2048")
+    print(f"Auto strategy: CUTLASS (small M/E) ↔ cuBLASLt-seq (large M/E), threshold=3072")
     print("=" * 120)
 
     for K, N in dim_configs:
@@ -99,7 +99,7 @@ def main():
                 lambda: grouped_gemm_opt(inp, w, tpe, TileConfig.AUTO, sort_by_m=False))
             auto_tflops = total_flops / (auto_lat * 1e-3) / 1e12
 
-            backend = "cuBLAS-seq" if avg_m >= 2048 else "CUTLASS"
+            backend = "cuBLASLt" if avg_m >= 3072 else "CUTLASS"
             speedup = std_lat / auto_lat
             marker = " ◀" if speedup > 1.0 else ""
 
