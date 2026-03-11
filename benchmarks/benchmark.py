@@ -1,6 +1,10 @@
 """
 Comprehensive benchmark: CUTLASS Persistent Grouped GEMM vs baselines.
 
+Weight shape: same as torch.nn.Linear — (out_features, in_features) = (N, K).
+  - expert_weights: [num_experts, N, K]; dense_weight: [N, K].
+  - F.linear(input, weight) uses this convention.
+
 Compares:
   1. Dense GEMM (cuBLAS) — upper bound throughput reference
   2. Sequential cuBLAS — one GEMM per expert, sequential launches
@@ -80,7 +84,7 @@ def random_distribution(total_tokens: int, num_experts: int) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def dense_gemm(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """Single dense GEMM via cuBLAS. weight is [N, K]."""
+    """Single dense GEMM via cuBLAS. weight shape = (out_features, in_features) = (N, K), same as torch.nn.Linear."""
     return F.linear(input, weight)
 
 
@@ -89,7 +93,7 @@ def sequential_gemm(
     weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
-    """Per-expert sequential cuBLAS GEMMs."""
+    """Per-expert sequential cuBLAS GEMMs. weights: [E, N, K] = (out_features, in_features) per expert, same as torch.nn.Linear."""
     outputs = []
     offset = 0
     for g in range(weights.size(0)):
@@ -108,10 +112,10 @@ def batched_gemm_padded(
     weights: torch.Tensor,
     tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
-    """Padded batched GEMM: pad all experts to max-M, use torch.bmm."""
+    """Padded batched GEMM: pad all experts to max-M, use torch.bmm. weights: [E, N, K] (torch.nn.Linear shape)."""
     num_experts = weights.size(0)
     K = input.size(1)
-    N = weights.size(1)
+    N = weights.size(1)  # out_features
     max_m = tokens_per_expert.max().item()
 
     batched_input = torch.zeros(num_experts, max_m, K,
@@ -165,6 +169,7 @@ def verify_accuracy(
 
     tpe = uniform_distribution(total_tokens, num_experts)
     input_tensor = torch.randn(total_tokens, K, device=device, dtype=dtype)
+    # Weights in torch.nn.Linear convention: (out_features, in_features) = (N, K) per expert -> [E, N, K]
     expert_weights = torch.randn(num_experts, N, K, device=device, dtype=dtype)
 
     ref_output = sequential_gemm(input_tensor, expert_weights, tpe)
@@ -324,12 +329,12 @@ def run_benchmark(
 
     total_flops = compute_flops(tpe, K, N)
 
-    # Allocate tensors
+    # Allocate tensors. Weights use torch.nn.Linear shape: (out_features, in_features) = (N, K)
     input_tensor = torch.randn(total_tokens, K, device=device, dtype=dtype)
-    expert_weights = torch.randn(num_experts, N, K, device=device, dtype=dtype)
+    expert_weights = torch.randn(num_experts, N, K, device=device, dtype=dtype)  # [E, N, K]
 
     # 1. Dense GEMM baseline (same total compute as single large matmul)
-    dense_weight = torch.randn(N, K, device=device, dtype=dtype)
+    dense_weight = torch.randn(N, K, device=device, dtype=dtype)  # (out_features, in_features)
     dense_latency = benchmark_fn(lambda: dense_gemm(input_tensor, dense_weight))
     dense_tflops = total_flops / (dense_latency * 1e-3) / 1e12
     results.append(BenchResult("Dense cuBLAS", dense_latency, dense_tflops, 1.0))
@@ -350,8 +355,7 @@ def run_benchmark(
 
     # 4. Standard grouped_gemm (tgale96) — CUTLASS 2.x grouped kernel
     if HAS_STANDARD_GMM:
-        # standard gmm expects: a=[total_tokens, K], b=[E, K, N], batch_sizes CPU
-        # with trans_b=False: computes a @ b, so b must be [E, K, N]
+        # standard gmm expects b=[E, K, N]; we have weights [E, N, K] (torch.nn.Linear), so transpose
         weights_kn = expert_weights.transpose(1, 2).contiguous()  # [E, N, K] → [E, K, N]
         tpe_cpu = tpe.cpu()
         try:

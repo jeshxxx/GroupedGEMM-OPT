@@ -39,7 +39,7 @@ def grouped_gemm_opt(
 
     Args:
         input:  [total_tokens, K] — contiguous, tokens sorted by expert.
-        weights: [num_experts, N, K] — expert weights (transposed layout).
+        weights: [num_experts, N, K] — expert weights, same shape as torch.nn.Linear (out_features, in_features).
         tokens_per_expert: [num_experts] int64 tensor.
         tile_config: Kernel configuration. AUTO recommended.
         sort_by_m: Sort experts by descending token count before dispatch.
