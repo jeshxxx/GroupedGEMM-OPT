@@ -364,29 +364,8 @@ def run_benchmark(
             results.append(BenchResult("Standard gmm", float('inf'), 0.0, 0.0))
             print(f"  WARNING: Standard gmm failed: {e}")
 
-    # 5. Triton Fused MoE (zero padding)
-    if HAS_TRITON_FUSED:
-        triton_configs = [
-            ("M128 N128 K64",  128, 128, 64),
-            ("M128 N256 K64",  128, 256, 64),
-        ]
-        for tc_name, bm, bn, bk in triton_configs:
-            try:
-                triton_latency = benchmark_fn(
-                    lambda bm=bm, bn=bn, bk=bk: triton_fused_moe(
-                        input_tensor, expert_weights, tpe, bm, bn, bk))
-                triton_tflops = total_flops / (triton_latency * 1e-3) / 1e12
-                results.append(BenchResult(
-                    f"Triton Fused ({tc_name})",
-                    triton_latency, triton_tflops,
-                    dense_latency / triton_latency))
-            except Exception as e:
-                results.append(BenchResult(
-                    f"Triton Fused ({tc_name})",
-                    float('inf'), 0.0, 0.0))
-                print(f"  WARNING: Triton Fused {tc_name} failed: {e}")
-
-    # 6. CUTLASS Persistent Grouped GEMM (opt) — each config independently
+    # 5. CUTLASS Persistent Grouped GEMM (opt) — run BEFORE Triton to avoid
+    #    Triton JIT/context interference affecting CUTLASS measurements
     if HAS_CUTLASS_GROUPED:
         # Determine which config Auto would select (for annotation only)
         auto_output = grouped_gemm_opt(input_tensor, expert_weights, tpe,
@@ -415,6 +394,29 @@ def run_benchmark(
                     f"CUTLASS ({tc_name}){suffix}",
                     float('inf'), 0.0, 0.0))
                 print(f"  WARNING: {tc_name} failed: {e}")
+
+    # 6. Triton Fused MoE (zero padding) — run LAST to avoid JIT affecting other measurements
+    if HAS_TRITON_FUSED:
+        torch.cuda.synchronize()
+        triton_configs = [
+            ("M128 N128 K64",  128, 128, 64),
+            ("M128 N256 K64",  128, 256, 64),
+        ]
+        for tc_name, bm, bn, bk in triton_configs:
+            try:
+                triton_latency = benchmark_fn(
+                    lambda bm=bm, bn=bn, bk=bk: triton_fused_moe(
+                        input_tensor, expert_weights, tpe, bm, bn, bk))
+                triton_tflops = total_flops / (triton_latency * 1e-3) / 1e12
+                results.append(BenchResult(
+                    f"Triton Fused ({tc_name})",
+                    triton_latency, triton_tflops,
+                    dense_latency / triton_latency))
+            except Exception as e:
+                results.append(BenchResult(
+                    f"Triton Fused ({tc_name})",
+                    float('inf'), 0.0, 0.0))
+                print(f"  WARNING: Triton Fused {tc_name} failed: {e}")
 
     return results
 

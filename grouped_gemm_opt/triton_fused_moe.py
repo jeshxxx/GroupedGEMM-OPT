@@ -126,15 +126,9 @@ def triton_fused_moe(
     sorted_ids, expert_ids, offsets = _prepare_expert_mapping(
         tokens_per_expert, input.device)
 
-    # Max experts a single tile can span: ceil(BLOCK_M / min_nonzero_tokens) + 1
-    nonzero_tpe = tokens_per_expert[tokens_per_expert > 0]
-    if len(nonzero_tpe) > 0:
-        min_tpe = int(nonzero_tpe.min().item())
-        max_experts_per_tile = min((BLOCK_M // max(min_tpe, 1)) + 2, num_experts)
-    else:
-        max_experts_per_tile = 1
-    # Clamp to reasonable compile-time values (Triton compiles per unique value)
-    max_experts_per_tile = min(max(max_experts_per_tile, 1), 64)
+    # Fixed at 4: covers tiles spanning up to 4 experts (BLOCK_M=128, >=32 tokens/expert).
+    # Using a constant avoids Triton recompiling for every unique value.
+    max_experts_per_tile = 4
 
     grid = (triton.cdiv(total_tokens, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
