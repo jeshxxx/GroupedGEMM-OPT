@@ -4,9 +4,9 @@ Focused benchmark: Standard gmm vs our implementations.
 Sweeps total_tokens in [74400, 595200] with num_experts=64, random distribution, BF16.
 Three (hidden_dim, ffn_dim) configs: (2048,1280), (2048,2560), (1280,2048).
 
-Methods compared:
-  - Standard gmm (CUTLASS 2.x grouped)
-  - Ours: CUTLASS persistent, cuBLASLt sequential, Triton one-kernel
+IMPORTANT: Triton benchmarks run AFTER all CUTLASS/cuBLAS benchmarks to avoid
+Triton JIT compilation and kernel execution polluting GPU state (L2 cache,
+CUDA driver state) and skewing CUTLASS/cuBLAS measurements.
 """
 
 import torch
@@ -78,6 +78,49 @@ def main():
     print("=" * 130)
 
     for K, N in dim_configs:
+        # ── Phase 1: benchmark non-Triton methods for ALL token counts ──
+        # This ensures Triton JIT/execution never contaminates these measurements.
+        all_results = {}
+        test_data = {}
+
+        for total_tokens in token_counts:
+            tpe = random_distribution(total_tokens, num_experts)
+            inp = torch.randn(total_tokens, K, device=device, dtype=dtype)
+            w = torch.randn(num_experts, N, K, device=device, dtype=dtype)
+            w_kn = w.transpose(1, 2).contiguous()
+            tpe_cpu = tpe.cpu()
+
+            results = {}
+
+            results["Std gmm"] = benchmark_fn(
+                lambda: standard_gmm(inp, w_kn, tpe_cpu, trans_b=False))
+
+            results["CUTLASS"] = benchmark_fn(
+                lambda: grouped_gemm_opt(inp, w, tpe,
+                                         TileConfig.Co_128x256x64, sort_by_m=False))
+
+            results["cuBLASLt"] = benchmark_fn(
+                lambda: grouped_gemm_opt(inp, w, tpe,
+                                         TileConfig.CuBLAS_Seq, sort_by_m=False))
+
+            all_results[total_tokens] = results
+            test_data[total_tokens] = (inp, w, w_kn, tpe, tpe_cpu)
+
+        # ── Phase 2: benchmark Triton methods (JIT runs here, isolated) ──
+        if HAS_TRITON_GG:
+            torch.cuda.synchronize()
+            for total_tokens in token_counts:
+                inp, w, w_kn, tpe, tpe_cpu = test_data[total_tokens]
+
+                all_results[total_tokens]["Triton128"] = benchmark_fn(
+                    lambda: triton_grouped_gemm(inp, w, tpe, 128, 128, 64,
+                                                num_warps=4, num_stages=3))
+
+                all_results[total_tokens]["Triton256"] = benchmark_fn(
+                    lambda: triton_grouped_gemm(inp, w, tpe, 128, 256, 64,
+                                                num_warps=8, num_stages=3))
+
+        # ── Print results ──
         print(f"\n{'━' * 130}")
         print(f"  K={K}, N={N}")
         print(f"{'━' * 130}")
@@ -93,68 +136,32 @@ def main():
 
         for total_tokens in token_counts:
             avg_m = total_tokens // num_experts
-            tpe = random_distribution(total_tokens, num_experts)
-            total_flops = int(2 * tpe.sum().item() * N * K)
+            results = all_results[total_tokens]
 
-            inp = torch.randn(total_tokens, K, device=device, dtype=dtype)
-            w = torch.randn(num_experts, N, K, device=device, dtype=dtype)
-            w_kn = w.transpose(1, 2).contiguous()
-            tpe_cpu = tpe.cpu()
-
-            results = {}
-
-            # Standard gmm
-            std_lat = benchmark_fn(
-                lambda: standard_gmm(inp, w_kn, tpe_cpu, trans_b=False))
-            results["Std gmm"] = std_lat
-
-            # CUTLASS persistent (Co 128x256x64)
-            cut_lat = benchmark_fn(
-                lambda: grouped_gemm_opt(inp, w, tpe,
-                                         TileConfig.Co_128x256x64, sort_by_m=False))
-            results["CUTLASS"] = cut_lat
-
-            # cuBLASLt sequential
-            cublas_lat = benchmark_fn(
-                lambda: grouped_gemm_opt(inp, w, tpe,
-                                         TileConfig.CuBLAS_Seq, sort_by_m=False))
-            results["cuBLASLt"] = cublas_lat
-
-            # Triton one-kernel 128x128x64
-            if HAS_TRITON_GG:
-                t128_lat = benchmark_fn(
-                    lambda: triton_grouped_gemm(inp, w, tpe, 128, 128, 64,
-                                                num_warps=4, num_stages=3))
-                results["Triton128"] = t128_lat
-
-                # Triton one-kernel 128x256x64
-                t256_lat = benchmark_fn(
-                    lambda: triton_grouped_gemm(inp, w, tpe, 128, 256, 64,
-                                                num_warps=8, num_stages=3))
-                results["Triton256"] = t256_lat
-
-            # Find best non-standard method
             ours = {k: v for k, v in results.items() if k != "Std gmm"}
             best_name = min(ours, key=ours.get)
             best_lat = ours[best_name]
+            std_lat = results["Std gmm"]
             speedup = std_lat / best_lat
 
-            def fmt(lat):
-                return f"{lat:>10.3f}"
-
-            line = f"  {total_tokens:>8}  {avg_m:>6}"
-            line += fmt(std_lat)
-            line += fmt(results.get("CUTLASS", float('inf')))
-            line += fmt(results.get("cuBLASLt", float('inf')))
-            line += fmt(results.get("Triton128", float('inf')))
-            line += fmt(results.get("Triton256", float('inf')))
+            def fmt(name):
+                v = results.get(name)
+                return f"{v:>10.3f}" if v is not None else f"{'N/A':>10}"
 
             marker = " ◀" if speedup > 1.0 else ""
-            line += f"  {best_name:>10}  {speedup:>7.2f}x{marker}"
-            print(line)
+            print(f"  {total_tokens:>8}  {avg_m:>6}"
+                  f"{fmt('Std gmm')}"
+                  f"{fmt('CUTLASS')}"
+                  f"{fmt('cuBLASLt')}"
+                  f"{fmt('Triton128')}"
+                  f"{fmt('Triton256')}"
+                  f"  {best_name:>10}  {speedup:>7.2f}x{marker}")
 
-            del inp, w, w_kn
-            torch.cuda.empty_cache()
+        # Cleanup
+        for v in test_data.values():
+            del v
+        test_data.clear()
+        torch.cuda.empty_cache()
 
     print(f"\n{'=' * 130}")
     print("All latencies in ms. 'Best' = fastest of our methods. 'vs Std' = Std gmm / Best.")
