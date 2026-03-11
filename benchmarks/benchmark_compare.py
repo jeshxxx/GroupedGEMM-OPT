@@ -65,7 +65,7 @@ def main():
     dtype = torch.bfloat16
     num_experts = 64
 
-    token_counts = [74400, 148800, 223200, 297600, 446400, 595200]
+    token_counts = [111600, 223200, 334800, 446400, 669600, 892800]
     dim_configs = [
         (2048, 1280),
         (2048, 2560),
