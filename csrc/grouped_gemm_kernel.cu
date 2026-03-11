@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -257,12 +258,88 @@ torch::Tensor launch_grouped_gemm(
 }
 
 // ---------------------------------------------------------------------------
-// Auto tile selection
+// cuBLAS sequential GEMM — one cublasGemmEx per expert from C++.
+// For large avg M/expert, each GEMM is big enough that cuBLAS's highly
+// optimized per-GEMM kernel beats the grouped GEMM overhead.
+// ---------------------------------------------------------------------------
+
+static torch::Tensor launch_cublas_sequential(
+    const torch::Tensor& input,
+    const torch::Tensor& weights,
+    const torch::Tensor& tokens_per_expert,
+    cudaStream_t stream)
+{
+    const int total_tokens = input.size(0);
+    const int K = input.size(1);
+    const int N = weights.size(1);
+    const int G = tokens_per_expert.size(0);
+
+    auto output = torch::empty({total_tokens, N},
+        torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+
+    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
+    cublasSetStream(handle, stream);
+
+    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
+    cudaDataType data_type = (input.scalar_type() == torch::kBFloat16)
+        ? CUDA_R_16BF : CUDA_R_16F;
+    float alpha = 1.0f, beta = 0.0f;
+    const int elem_size = 2;
+
+    // Row-major C[M,N] = A[M,K] @ B[N,K]^T
+    // cuBLAS col-major: treat row-major A as col-major A^T (K×M, ld=K),
+    // row-major B as col-major B^T (K×N, ld=K).
+    // Compute: C_cm(N×M) = B_cm_T(N×K) × A_cm(K×M)
+    //  → cublasGemmEx(CUBLAS_OP_T, CUBLAS_OP_N, N, M_g, K, ..., B, K, A, K, ..., C, N)
+
+    int64_t off = 0;
+    for (int g = 0; g < G; ++g) {
+        int M_g = static_cast<int>(tpe[g]);
+        if (M_g == 0) { off += M_g; continue; }
+
+        const void* B_ptr = static_cast<const char*>(weights.data_ptr())
+            + int64_t(g) * N * K * elem_size;
+        const void* A_ptr = static_cast<const char*>(input.data_ptr())
+            + off * K * elem_size;
+        void* C_ptr = static_cast<char*>(output.data_ptr())
+            + off * N * elem_size;
+
+        cublasGemmEx(handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M_g, K,
+            &alpha,
+            B_ptr, data_type, K,
+            A_ptr, data_type, K,
+            &beta,
+            C_ptr, data_type, N,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+        off += M_g;
+    }
+
+    return output;
+}
+
+// ---------------------------------------------------------------------------
+// Auto tile selection — hybrid CUTLASS/cuBLAS
 // ---------------------------------------------------------------------------
 
 static TileConfig auto_select_tile(
     const torch::Tensor& tokens_per_expert, int K, int N)
 {
+    const int G = tokens_per_expert.size(0);
+    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
+    int64_t total_tokens = 0;
+    for (int g = 0; g < G; ++g) total_tokens += tpe[g];
+    int avg_m = G > 0 ? static_cast<int>(total_tokens / G) : 0;
+
+    // Large avg M/expert: cuBLAS per-expert GEMMs achieve higher efficiency
+    // than CUTLASS Ptr-Array grouped GEMM (no TMA descriptor overhead per tile).
+    if (avg_m >= 2048) {
+        return TileConfig::CuBLAS_Seq;
+    }
+
     if (N < 256) {
         return TileConfig::Co_128x128x64;
     }
@@ -297,6 +374,11 @@ torch::Tensor grouped_gemm_forward(
 
     if (tile_config == TileConfig::Auto) {
         tile_config = auto_select_tile(tokens_per_expert, K, N);
+    }
+
+    // cuBLAS sequential path — no CUTLASS, no TMA
+    if (tile_config == TileConfig::CuBLAS_Seq) {
+        return launch_cublas_sequential(input, weights, tokens_per_expert, stream);
     }
 
     if (input.scalar_type() == torch::kBFloat16) {

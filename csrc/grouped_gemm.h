@@ -14,6 +14,8 @@ enum class TileConfig {
     PP_128x256x64  = 3,
     // Auto: selects best config based on problem dimensions
     Auto           = 4,
+    // cuBLAS sequential: one cublasGemmEx per expert (best for large M/expert)
+    CuBLAS_Seq     = 5,
 };
 
 torch::Tensor grouped_gemm_forward(

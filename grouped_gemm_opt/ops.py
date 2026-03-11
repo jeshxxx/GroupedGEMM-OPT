@@ -6,23 +6,26 @@ from grouped_gemm_opt._C import grouped_gemm_opt_forward
 
 
 class TileConfig(IntEnum):
-    """Tile/schedule config for CUTLASS persistent grouped GEMM.
+    """Tile/schedule config for grouped GEMM.
 
-    Cooperative schedule:
+    CUTLASS Cooperative schedule:
       Co_128x128x64  — baseline, good for small avg M
       Co_128x256x64  — wider N tile
 
-    Pingpong schedule (for FP8; not recommended for BF16/FP16):
+    CUTLASS Pingpong schedule:
       PP_128x128x128 — deep K tile + Cluster 2x1x1
       PP_128x256x64  — wide N tile with Pingpong
 
-    Auto: selects best based on K, N, avg tokens/expert
+    cuBLAS sequential: one cuBLAS GEMM per expert (best for large avg M/expert)
+
+    Auto: CUTLASS for small avg M/expert, cuBLAS for large avg M/expert
     """
     Co_128x128x64  = 0
     Co_128x256x64  = 1
     PP_128x128x128 = 2
     PP_128x256x64  = 3
     AUTO           = 4
+    CuBLAS_Seq     = 5
 
 
 def grouped_gemm_opt(

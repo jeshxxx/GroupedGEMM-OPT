@@ -368,14 +368,26 @@ def run_benchmark(
             results.append(BenchResult("Standard gmm", float('inf'), 0.0, 0.0))
             print(f"  WARNING: Standard gmm failed: {e}")
 
-    # 5. CUTLASS Persistent Grouped GEMM (opt) — run BEFORE Triton to avoid
-    #    Triton JIT/context interference affecting CUTLASS measurements
+    # 5. Grouped GEMM (opt) — run BEFORE Triton to avoid JIT interference
     if HAS_CUTLASS_GROUPED:
-        # Determine which config Auto would select (for annotation only)
-        auto_output = grouped_gemm_opt(input_tensor, expert_weights, tpe,
-                                       TileConfig.AUTO, sort_by_m=False)
-        auto_pick = "Co_128x256x64" if N >= 256 else "Co_128x128x64"
+        avg_m = total_tokens // num_experts if num_experts > 0 else 0
 
+        # Auto benchmark (hybrid CUTLASS/cuBLAS)
+        try:
+            auto_latency = benchmark_fn(
+                lambda: grouped_gemm_opt(input_tensor, expert_weights, tpe,
+                                         TileConfig.AUTO, sort_by_m=False))
+            auto_tflops = total_flops / (auto_latency * 1e-3) / 1e12
+            auto_backend = "cuBLAS" if avg_m >= 2048 else "CUTLASS"
+            results.append(BenchResult(
+                f"Ours Auto ({auto_backend})",
+                auto_latency, auto_tflops,
+                dense_latency / auto_latency))
+        except Exception as e:
+            results.append(BenchResult("Ours Auto", float('inf'), 0.0, 0.0))
+            print(f"  WARNING: Auto failed: {e}")
+
+        # Individual CUTLASS tile configs
         configs = [
             ("Co 128x128x64",  TileConfig.Co_128x128x64),
             ("Co 128x256x64",  TileConfig.Co_128x256x64),
@@ -383,21 +395,34 @@ def run_benchmark(
             ("PP 128x256x64",  TileConfig.PP_128x256x64),
         ]
         for tc_name, tc in configs:
-            suffix = " ★Auto" if tc_name.replace(" ", "_") == auto_pick else ""
             try:
                 cutlass_latency = benchmark_fn(
                     lambda tc=tc: grouped_gemm_opt(input_tensor, expert_weights, tpe, tc,
                                                    sort_by_m=False))
                 cutlass_tflops = total_flops / (cutlass_latency * 1e-3) / 1e12
                 results.append(BenchResult(
-                    f"CUTLASS ({tc_name}){suffix}",
+                    f"CUTLASS ({tc_name})",
                     cutlass_latency, cutlass_tflops,
                     dense_latency / cutlass_latency))
             except Exception as e:
                 results.append(BenchResult(
-                    f"CUTLASS ({tc_name}){suffix}",
+                    f"CUTLASS ({tc_name})",
                     float('inf'), 0.0, 0.0))
                 print(f"  WARNING: {tc_name} failed: {e}")
+
+        # cuBLAS sequential
+        try:
+            cublas_latency = benchmark_fn(
+                lambda: grouped_gemm_opt(input_tensor, expert_weights, tpe,
+                                         TileConfig.CuBLAS_Seq, sort_by_m=False))
+            cublas_tflops = total_flops / (cublas_latency * 1e-3) / 1e12
+            results.append(BenchResult(
+                "cuBLAS Seq",
+                cublas_latency, cublas_tflops,
+                dense_latency / cublas_latency))
+        except Exception as e:
+            results.append(BenchResult("cuBLAS Seq", float('inf'), 0.0, 0.0))
+            print(f"  WARNING: cuBLAS Seq failed: {e}")
 
     # 6. Triton Fused MoE (zero padding) — run LAST to avoid JIT affecting other measurements
     if HAS_TRITON_FUSED:
