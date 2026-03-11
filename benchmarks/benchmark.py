@@ -27,6 +27,12 @@ except ImportError:
     print("  Install with: cd /path/to/groupedgemm && pip install -e . --no-build-isolation")
 
 try:
+    from grouped_gemm_opt.triton_fused_moe import triton_fused_moe
+    HAS_TRITON_FUSED = True
+except ImportError:
+    HAS_TRITON_FUSED = False
+
+try:
     from grouped_gemm.ops import gmm as standard_gmm
     HAS_STANDARD_GMM = True
 except ImportError:
@@ -191,6 +197,29 @@ def verify_accuracy(
                                           float('inf'), 0.0, False))
             print(f"  WARNING: Standard gmm accuracy check failed: {e}")
 
+    if HAS_TRITON_FUSED:
+        try:
+            test_output = triton_fused_moe(input_tensor, expert_weights, tpe)
+            torch.cuda.synchronize()
+            diff = (test_output.float() - ref_output.float()).abs()
+            ref_abs = ref_output.float().abs().clamp(min=1e-6)
+            max_abs = diff.max().item()
+            mean_abs = diff.mean().item()
+            max_rel = (diff / ref_abs).max().item()
+            flat_test = test_output.float().flatten()
+            flat_ref = ref_output.float().flatten()
+            cos = torch.nn.functional.cosine_similarity(
+                flat_test.unsqueeze(0), flat_ref.unsqueeze(0)).item()
+            atol = 1e-2 if dtype == torch.bfloat16 else 5e-3
+            passed = torch.allclose(test_output.float(), ref_output.float(),
+                                    atol=atol, rtol=1e-2)
+            results.append(AccuracyResult("Triton Fused", max_abs, mean_abs,
+                                          max_rel, cos, passed))
+        except Exception as e:
+            results.append(AccuracyResult("Triton Fused", float('inf'), float('inf'),
+                                          float('inf'), 0.0, False))
+            print(f"  WARNING: Triton Fused accuracy check failed: {e}")
+
     if not HAS_CUTLASS_GROUPED:
         return results
 
@@ -246,18 +275,8 @@ class BenchResult:
     efficiency: float  # vs dense GEMM
 
 
-def _flush_l2():
-    """Flush GPU L2 cache by touching a large buffer."""
-    buf = torch.empty(40 * 1024 * 1024, dtype=torch.int8, device="cuda")  # 40MB > H100 L2
-    buf.zero_()
-    del buf
-    torch.cuda.synchronize()
-
-
-def benchmark_fn(fn, warmup: int = 20, repeat: int = 50, flush_l2: bool = True) -> float:
+def benchmark_fn(fn, warmup: int = 10, repeat: int = 50) -> float:
     """Returns median latency in milliseconds."""
-    if flush_l2:
-        _flush_l2()
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -345,7 +364,29 @@ def run_benchmark(
             results.append(BenchResult("Standard gmm", float('inf'), 0.0, 0.0))
             print(f"  WARNING: Standard gmm failed: {e}")
 
-    # 5. CUTLASS Persistent Grouped GEMM (opt) — each config independently
+    # 5. Triton Fused MoE (zero padding)
+    if HAS_TRITON_FUSED:
+        triton_configs = [
+            ("M128 N128 K64",  128, 128, 64),
+            ("M128 N256 K64",  128, 256, 64),
+        ]
+        for tc_name, bm, bn, bk in triton_configs:
+            try:
+                triton_latency = benchmark_fn(
+                    lambda bm=bm, bn=bn, bk=bk: triton_fused_moe(
+                        input_tensor, expert_weights, tpe, bm, bn, bk))
+                triton_tflops = total_flops / (triton_latency * 1e-3) / 1e12
+                results.append(BenchResult(
+                    f"Triton Fused ({tc_name})",
+                    triton_latency, triton_tflops,
+                    dense_latency / triton_latency))
+            except Exception as e:
+                results.append(BenchResult(
+                    f"Triton Fused ({tc_name})",
+                    float('inf'), 0.0, 0.0))
+                print(f"  WARNING: Triton Fused {tc_name} failed: {e}")
+
+    # 6. CUTLASS Persistent Grouped GEMM (opt) — each config independently
     if HAS_CUTLASS_GROUPED:
         # Determine which config Auto would select (for annotation only)
         auto_output = grouped_gemm_opt(input_tensor, expert_weights, tpe,
