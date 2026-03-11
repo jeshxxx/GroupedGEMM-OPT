@@ -191,17 +191,17 @@ torch::Tensor launch_grouped_gemm(
     gemm_args = typename DeviceGemm::Arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {args.num_groups,
-         args.dev<UnderlyingProblemShape>(args.off_problem_sizes),
+         args.template dev<UnderlyingProblemShape>(args.off_problem_sizes),
          args.host_problem_sizes.data()},
-        {args.dev<const ElementA*>(args.off_ptr_A),
-         args.dev<StrideA>(args.off_stride_A),
-         args.dev<const ElementB*>(args.off_ptr_B),
-         args.dev<StrideB>(args.off_stride_B)},
+        {args.template dev<const ElementA*>(args.off_ptr_A),
+         args.template dev<StrideA>(args.off_stride_A),
+         args.template dev<const ElementB*>(args.off_ptr_B),
+         args.template dev<StrideB>(args.off_stride_B)},
         {fusion_args,
-         args.dev<const ElementC*>(args.off_ptr_C),
-         args.dev<StrideC>(args.off_stride_C),
-         args.dev<ElementC*>(args.off_ptr_D),
-         args.dev<StrideD>(args.off_stride_D)},
+         args.template dev<const ElementC*>(args.off_ptr_C),
+         args.template dev<StrideC>(args.off_stride_C),
+         args.template dev<ElementC*>(args.off_ptr_D),
+         args.template dev<StrideD>(args.off_stride_D)},
         hw_info
     };
 
