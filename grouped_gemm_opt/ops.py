@@ -60,6 +60,18 @@ def grouped_gemm_opt(
         f"!= total_tokens={input.size(0)}"
     )
 
+    # Filter out experts with 0 tokens: CUTLASS TMA descriptor creation
+    # uses the first group's dimensions — M=0 causes cuTensorMapEncodeTiled
+    # to fail with CUDA_ERROR_ILLEGAL_ADDRESS (error 700).
+    nonzero_mask = tokens_per_expert > 0
+    if not nonzero_mask.all():
+        tokens_per_expert = tokens_per_expert[nonzero_mask]
+        weights = weights[nonzero_mask]
+
+    if tokens_per_expert.size(0) == 0:
+        return torch.empty(0, weights.size(1) if weights.dim() == 3 else 0,
+                           device=input.device, dtype=input.dtype)
+
     if sort_by_m and tokens_per_expert.size(0) > 1:
         input, weights, tokens_per_expert = _sort_by_descending_m(
             input, weights, tokens_per_expert)
