@@ -32,15 +32,15 @@ def _grouped_gemm_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    expert_id = tl.load(tile_expert_ids_ptr + pid_m)
-    m_start = tl.load(tile_m_starts_ptr + pid_m)
-    expert_end = tl.load(offsets_ptr + expert_id + 1)
+    expert_id = tl.load(tile_expert_ids_ptr + pid_m).to(tl.int64)
+    m_start = tl.load(tile_m_starts_ptr + pid_m)  # int64
+    expert_end = tl.load(offsets_ptr + expert_id + 1)  # int64
 
-    m_range = m_start + tl.arange(0, BLOCK_M)
+    m_range = m_start + tl.arange(0, BLOCK_M).to(tl.int64)
     m_mask = m_range < expert_end
 
     n_start = pid_n * BLOCK_N
-    n_range = n_start + tl.arange(0, BLOCK_N)
+    n_range = (n_start + tl.arange(0, BLOCK_N)).to(tl.int64)
     n_mask = n_range < N
 
     # C[m, n] = sum_k A[m, k] * B[expert_id, n, k]
@@ -49,7 +49,7 @@ def _grouped_gemm_kernel(
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     for k_start in range(0, K, BLOCK_K):
-        k_range = k_start + tl.arange(0, BLOCK_K)
+        k_range = (k_start + tl.arange(0, BLOCK_K)).to(tl.int64)
         k_mask = k_range < K
 
         a = tl.load(
@@ -112,8 +112,8 @@ def _build_tile_map(tokens_per_expert: torch.Tensor, BLOCK_M: int, device: torch
 
     return (
         tile_expert_ids.to(device),
-        tile_m_starts.to(torch.int32).to(device),
-        offsets.to(torch.int32).to(device),
+        tile_m_starts.to(torch.int64).to(device),
+        offsets.to(torch.int64).to(device),
         total_m_tiles,
     )
 
