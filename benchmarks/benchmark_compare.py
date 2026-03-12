@@ -33,6 +33,13 @@ except ImportError:
     HAS_STANDARD = False
     raise RuntimeError("grouped_gemm (standard) not installed. pip install grouped_gemm")
 
+try:
+    from transformer_engine.pytorch import GroupedLinear as TEGroupedLinear
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
+    print("INFO: transformer_engine not installed. Skipping TE GroupedLinear benchmark.")
+
 
 def random_distribution(total_tokens: int, num_experts: int) -> torch.Tensor:
     alpha = torch.ones(num_experts)
@@ -110,6 +117,15 @@ def main():
                 lambda: grouped_gemm_opt(inp, w, tpe,
                                          TileConfig.CuBLAS_Seq, sort_by_m=False))
 
+            if HAS_TE:
+                te_mod = TEGroupedLinear(K, N, num_experts, bias=False,
+                                         device=device,
+                                         params_dtype=dtype)
+                m_splits = tpe.tolist()
+                results["TE GrpLin"] = benchmark_fn(
+                    lambda: te_mod(inp, m_splits=m_splits))
+                del te_mod
+
             all_results[total_tokens] = results
             test_data[total_tokens] = (inp, w, w_kn, tpe, tpe_cpu)
 
@@ -131,23 +147,21 @@ def main():
         print(f"\n{'━' * 145}")
         print(f"  K={K}, N={N}")
         print(f"{'━' * 145}")
-        header = (f"  {'tokens':>8}  {'M/E':>6}"
-                  f"  {'Dense':>10}"
-                  f"  {'Std gmm':>10}"
-                  f"  {'CUTLASS':>10}"
-                  f"  {'cuBLASLt':>10}"
-                  f"  {'Triton128':>10}"
-                  f"  {'Triton256':>10}"
-                  f"  {'Best':>10}  {'vs Std':>8}  {'vs Dense':>9}")
+        cols = ["Dense", "Std gmm", "TE GrpLin", "CUTLASS", "cuBLASLt",
+                "Triton128", "Triton256"]
+        header = f"  {'tokens':>8}  {'M/E':>6}"
+        for c in cols:
+            header += f"  {c:>10}"
+        header += f"  {'Best':>10}  {'vs Std':>8}  {'vs Dense':>9}"
         print(header)
-        print(f"  {'─' * 135}")
+        print(f"  {'─' * (len(cols) * 12 + 50)}")
 
         for total_tokens in token_counts:
             avg_m = total_tokens // num_experts
             results = all_results[total_tokens]
 
-            ours = {k: v for k, v in results.items()
-                    if k not in ("Std gmm", "Dense")}
+            baselines = ("Std gmm", "Dense", "TE GrpLin")
+            ours = {k: v for k, v in results.items() if k not in baselines}
             best_name = min(ours, key=ours.get)
             best_lat = ours[best_name]
             std_lat = results["Std gmm"]
@@ -160,14 +174,11 @@ def main():
                 return f"{v:>10.3f}" if v is not None else f"{'N/A':>10}"
 
             marker = " ◀" if sp_std > 1.0 else ""
-            print(f"  {total_tokens:>8}  {avg_m:>6}"
-                  f"{fmt('Dense')}"
-                  f"{fmt('Std gmm')}"
-                  f"{fmt('CUTLASS')}"
-                  f"{fmt('cuBLASLt')}"
-                  f"{fmt('Triton128')}"
-                  f"{fmt('Triton256')}"
-                  f"  {best_name:>10}  {sp_std:>7.2f}x{marker}  {sp_dense:>8.1%}")
+            line = f"  {total_tokens:>8}  {avg_m:>6}"
+            for c in cols:
+                line += fmt(c)
+            line += f"  {best_name:>10}  {sp_std:>7.2f}x{marker}  {sp_dense:>8.1%}"
+            print(line)
 
         # Cleanup
         for v in test_data.values():
