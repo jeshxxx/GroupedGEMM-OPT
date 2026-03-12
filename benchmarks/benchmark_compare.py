@@ -120,18 +120,22 @@ def main():
                 lambda: grouped_gemm_opt(inp, w, tpe,
                                          TileConfig.CuBLAS_Seq, sort_by_m=False))
 
-            if HAS_TE:
+            all_results[total_tokens] = results
+            test_data[total_tokens] = (inp, w, w_kn, tpe, tpe_cpu)
+
+        # ── Phase 1.5: benchmark TE GroupedLinear (isolated from Phase 1) ──
+        if HAS_TE:
+            torch.cuda.synchronize()
+            for total_tokens in token_counts:
+                inp, w, w_kn, tpe, tpe_cpu = test_data[total_tokens]
                 te_mod = TEGroupedLinear(num_gemms=num_experts,
                                          in_features=K, out_features=N,
                                          bias=False, device=device,
                                          params_dtype=dtype)
                 m_splits = tpe.tolist()
-                results["TE GrpLin"] = benchmark_fn(
+                all_results[total_tokens]["TE GrpLin"] = benchmark_fn(
                     lambda: te_mod(inp, m_splits=m_splits))
                 del te_mod
-
-            all_results[total_tokens] = results
-            test_data[total_tokens] = (inp, w, w_kn, tpe, tpe_cpu)
 
         # ── Phase 2: benchmark Triton methods (JIT runs here, isolated) ──
         if HAS_TRITON_GG:
