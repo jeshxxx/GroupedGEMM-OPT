@@ -118,8 +118,9 @@ def main():
                                          TileConfig.CuBLAS_Seq, sort_by_m=False))
 
             if HAS_TE:
-                te_mod = TEGroupedLinear(K, N, num_experts, bias=False,
-                                         device=device,
+                te_mod = TEGroupedLinear(num_gemms=num_experts,
+                                         in_features=K, out_features=N,
+                                         bias=False, device=device,
                                          params_dtype=dtype)
                 m_splits = tpe.tolist()
                 results["TE GrpLin"] = benchmark_fn(
