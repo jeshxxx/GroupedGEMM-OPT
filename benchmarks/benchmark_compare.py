@@ -10,6 +10,7 @@ CUDA driver state) and skewing CUTLASS/cuBLAS measurements.
 """
 
 import torch
+import torch.nn.functional as F
 
 try:
     from grouped_gemm_opt import grouped_gemm_opt, TileConfig
@@ -72,10 +73,10 @@ def main():
         (1280, 2048),
     ]
 
-    print("=" * 130)
+    print("=" * 145)
     print(f"Grouped GEMM Comparison  |  GPU: {torch.cuda.get_device_name(0)}")
     print(f"num_experts={num_experts}, dtype=bf16, distribution=random")
-    print("=" * 130)
+    print("=" * 145)
 
     for K, N in dim_configs:
         # ── Phase 1: benchmark non-Triton methods for ALL token counts ──
@@ -91,6 +92,12 @@ def main():
             tpe_cpu = tpe.cpu()
 
             results = {}
+
+            # Dense cuBLAS: single large GEMM (upper bound reference)
+            dense_w = torch.randn(N, K, device=device, dtype=dtype)
+            results["Dense"] = benchmark_fn(
+                lambda: F.linear(inp, dense_w))
+            del dense_w
 
             results["Std gmm"] = benchmark_fn(
                 lambda: standard_gmm(inp, w_kn, tpe_cpu, trans_b=False))
@@ -121,41 +128,46 @@ def main():
                                                 num_warps=8, num_stages=3))
 
         # ── Print results ──
-        print(f"\n{'━' * 130}")
+        print(f"\n{'━' * 145}")
         print(f"  K={K}, N={N}")
-        print(f"{'━' * 130}")
+        print(f"{'━' * 145}")
         header = (f"  {'tokens':>8}  {'M/E':>6}"
+                  f"  {'Dense':>10}"
                   f"  {'Std gmm':>10}"
                   f"  {'CUTLASS':>10}"
                   f"  {'cuBLASLt':>10}"
                   f"  {'Triton128':>10}"
                   f"  {'Triton256':>10}"
-                  f"  {'Best':>10}  {'vs Std':>8}")
+                  f"  {'Best':>10}  {'vs Std':>8}  {'vs Dense':>9}")
         print(header)
-        print(f"  {'─' * 120}")
+        print(f"  {'─' * 135}")
 
         for total_tokens in token_counts:
             avg_m = total_tokens // num_experts
             results = all_results[total_tokens]
 
-            ours = {k: v for k, v in results.items() if k != "Std gmm"}
+            ours = {k: v for k, v in results.items()
+                    if k not in ("Std gmm", "Dense")}
             best_name = min(ours, key=ours.get)
             best_lat = ours[best_name]
             std_lat = results["Std gmm"]
-            speedup = std_lat / best_lat
+            dense_lat = results["Dense"]
+            sp_std = std_lat / best_lat
+            sp_dense = dense_lat / best_lat
 
             def fmt(name):
                 v = results.get(name)
                 return f"{v:>10.3f}" if v is not None else f"{'N/A':>10}"
 
-            marker = " ◀" if speedup > 1.0 else ""
+            marker = " ◀" if sp_std > 1.0 else ""
             print(f"  {total_tokens:>8}  {avg_m:>6}"
+                  f"{fmt('Dense')}"
                   f"{fmt('Std gmm')}"
                   f"{fmt('CUTLASS')}"
                   f"{fmt('cuBLASLt')}"
                   f"{fmt('Triton128')}"
                   f"{fmt('Triton256')}"
-                  f"  {best_name:>10}  {speedup:>7.2f}x{marker}")
+                  f"  {best_name:>10}  {sp_std:>7.2f}x{marker}  {sp_dense:>8.1%}")
 
         # Cleanup
         for v in test_data.values():
@@ -163,9 +175,10 @@ def main():
         test_data.clear()
         torch.cuda.empty_cache()
 
-    print(f"\n{'=' * 130}")
-    print("All latencies in ms. 'Best' = fastest of our methods. 'vs Std' = Std gmm / Best.")
-    print("=" * 130)
+    print(f"\n{'=' * 145}")
+    print("All latencies in ms. 'Best' = fastest of our methods.")
+    print("'vs Std' = Std gmm / Best.  'vs Dense' = Dense / Best (theoretical ceiling).")
+    print("=" * 145)
 
 
 if __name__ == "__main__":
