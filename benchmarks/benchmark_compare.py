@@ -41,9 +41,12 @@ except ImportError:
     print("INFO: transformer_engine not installed. Skipping TE GroupedLinear benchmark.")
 
 
-def random_distribution(total_tokens: int, num_experts: int) -> torch.Tensor:
+def random_distribution(total_tokens: int, num_experts: int, seed: int = 42) -> torch.Tensor:
+    rng_state = torch.random.get_rng_state()
+    torch.manual_seed(seed + total_tokens * 31 + num_experts * 7)
     alpha = torch.ones(num_experts)
     weights = torch.distributions.Dirichlet(alpha).sample()
+    torch.random.set_rng_state(rng_state)
     tpe = (weights * total_tokens).long()
     diff = total_tokens - tpe.sum().item()
     tpe[0] += diff
