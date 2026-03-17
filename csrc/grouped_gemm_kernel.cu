@@ -30,6 +30,23 @@ static int get_sm_count(int device_id) {
 }
 
 // ---------------------------------------------------------------------------
+// Cached pinned-memory buffer for async D2H of tokens_per_expert.
+// Avoids cudaMallocHost on every call (which itself can be ~50us).
+// ---------------------------------------------------------------------------
+static int64_t* s_pinned_tpe = nullptr;
+static int      s_pinned_tpe_cap = 0;
+
+static int64_t* get_pinned_tpe_buf(int num_groups) {
+    if (num_groups > s_pinned_tpe_cap) {
+        if (s_pinned_tpe) cudaFreeHost(s_pinned_tpe);
+        int new_cap = std::max(num_groups, 128);
+        cudaMallocHost(&s_pinned_tpe, new_cap * sizeof(int64_t));
+        s_pinned_tpe_cap = new_cap;
+    }
+    return s_pinned_tpe;
+}
+
+// ---------------------------------------------------------------------------
 // Per-group device arrays for CUTLASS grouped GEMM
 // ---------------------------------------------------------------------------
 
@@ -63,19 +80,23 @@ struct GroupedGemmArgs {
             static_cast<char*>(packed_device_buf.data_ptr()) + offset);
     }
 
+    // tpe: filtered tokens-per-expert (all > 0), length = num_groups.
+    // expert_map: expert_map[i] is the original expert index for group i.
     static GroupedGemmArgs prepare(
         const torch::Tensor& input,
         const torch::Tensor& weights,
         torch::Tensor& output,
-        const torch::Tensor& tokens_per_expert,
+        const int64_t* tpe,
+        int num_groups,
+        const int* expert_map,
         cudaStream_t stream,
         bool sort_by_m)
     {
         GroupedGemmArgs args;
-        args.num_groups = tokens_per_expert.size(0);
+        args.num_groups = num_groups;
         const int K = input.size(1);
         const int N = weights.size(1);
-        const int G = args.num_groups;
+        const int G = num_groups;
 
         // Compute layout offsets for the packed buffer (9 arrays, 16-byte aligned)
         size_t s_ps = G * sizeof(UnderlyingProblemShape);
@@ -112,8 +133,6 @@ struct GroupedGemmArgs {
         auto* h_sC = reinterpret_cast<StrideC*>(host_buf.data() + args.off_stride_C);
         auto* h_sD = reinterpret_cast<StrideD*>(host_buf.data() + args.off_stride_D);
 
-        const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
-
         // Build group ordering: optionally sort by descending M for better
         // persistent scheduler load balance. Only reorders pointer/stride
         // arrays — zero data movement cost.
@@ -125,24 +144,25 @@ struct GroupedGemmArgs {
             });
         }
 
-        // Precompute per-expert input/output offsets in original order
+        // Precompute per-group input/output offsets (cumulative sum of filtered tpe)
         std::vector<int64_t> offsets(G);
         int64_t off = 0;
-        for (int g = 0; g < G; ++g) {
-            offsets[g] = off;
-            off += tpe[g];
+        for (int i = 0; i < G; ++i) {
+            offsets[i] = off;
+            off += tpe[i];
         }
 
         // Populate arrays in (potentially sorted) order
         for (int i = 0; i < G; ++i) {
-            int g = order[i];
-            int M_g = static_cast<int>(tpe[g]);
-            int64_t a_off = offsets[g];
+            int slot = order[i];
+            int orig_expert = expert_map[slot];
+            int M_g = static_cast<int>(tpe[slot]);
+            int64_t a_off = offsets[slot];
 
             args.host_problem_sizes[i] = cute::make_shape(M_g, N, K);
 
             h_pA[i] = reinterpret_cast<const ElementA*>(input.data_ptr()) + a_off * K;
-            h_pB[i] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(g) * N * K;
+            h_pB[i] = reinterpret_cast<const ElementB*>(weights.data_ptr()) + int64_t(orig_expert) * N * K;
             h_pC[i] = reinterpret_cast<const ElementC*>(output.data_ptr()) + a_off * N;
             h_pD[i] = reinterpret_cast<ElementC*>(output.data_ptr()) + a_off * N;
 
@@ -175,7 +195,9 @@ template <typename KernelType>
 torch::Tensor launch_grouped_gemm(
     const torch::Tensor& input,
     const torch::Tensor& weights,
-    const torch::Tensor& tokens_per_expert,
+    const int64_t* tpe_cpu,
+    int num_groups,
+    const int* expert_map,
     cudaStream_t stream,
     bool sort_by_m)
 {
@@ -196,7 +218,7 @@ torch::Tensor launch_grouped_gemm(
         torch::TensorOptions().dtype(input.dtype()).device(input.device()));
 
     auto args = GroupedGemmArgs<KernelType>::prepare(
-        input, weights, output, tokens_per_expert, stream, sort_by_m);
+        input, weights, output, tpe_cpu, num_groups, expert_map, stream, sort_by_m);
 
     cutlass::KernelHardwareInfo hw_info{};
     hw_info.device_id = input.device().index();
@@ -266,29 +288,25 @@ torch::Tensor launch_grouped_gemm(
 static torch::Tensor launch_cublas_sequential(
     const torch::Tensor& input,
     const torch::Tensor& weights,
-    const torch::Tensor& tokens_per_expert,
+    const int64_t* tpe,
+    int num_groups,
     cudaStream_t stream)
 {
     const int total_tokens = input.size(0);
     const int N = weights.size(1);
-    const int G = tokens_per_expert.size(0);
 
     auto output = torch::empty({total_tokens, N},
         torch::TensorOptions().dtype(input.dtype()).device(input.device()));
 
-    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
-
     int64_t off = 0;
-    for (int g = 0; g < G; ++g) {
+    for (int g = 0; g < num_groups; ++g) {
         int64_t M_g = tpe[g];
         if (M_g == 0) continue;
 
-        // Views — zero-copy slicing
-        auto A_g = input.narrow(0, off, M_g);       // [M_g, K]
-        auto B_g_t = weights[g].t();                 // [K, N] transposed view
-        auto C_g = output.narrow(0, off, M_g);       // [M_g, N]
+        auto A_g = input.narrow(0, off, M_g);
+        auto B_g_t = weights[g].t();
+        auto C_g = output.narrow(0, off, M_g);
 
-        // at::mm_out → cuBLASLt with optimized algorithm selection + workspace
         at::mm_out(C_g, A_g, B_g_t);
 
         off += M_g;
@@ -302,10 +320,8 @@ static torch::Tensor launch_cublas_sequential(
 // ---------------------------------------------------------------------------
 
 static TileConfig auto_select_tile(
-    const torch::Tensor& tokens_per_expert, int K, int N)
+    const int64_t* tpe, int G, int K, int N)
 {
-    const int G = tokens_per_expert.size(0);
-    const auto* tpe = tokens_per_expert.data_ptr<int64_t>();
     int64_t total_tokens = 0;
     for (int g = 0; g < G; ++g) total_tokens += tpe[g];
     int avg_m = G > 0 ? static_cast<int>(total_tokens / G) : 0;
@@ -340,7 +356,6 @@ torch::Tensor grouped_gemm_forward(
     TORCH_CHECK(weights.is_cuda(), "weights must be on CUDA");
     TORCH_CHECK(input.dim() == 2, "input must be 2D [total_tokens, K]");
     TORCH_CHECK(weights.dim() == 3, "weights must be 3D [num_experts, N, K]");
-    TORCH_CHECK(tokens_per_expert.is_cpu(), "tokens_per_expert must be on CPU");
     TORCH_CHECK(input.size(1) == weights.size(2),
         "K mismatch: input=", input.size(1), " vs weights=", weights.size(2));
     TORCH_CHECK(input.is_contiguous() && weights.is_contiguous());
@@ -350,39 +365,82 @@ torch::Tensor grouped_gemm_forward(
 
     const int K = input.size(1);
     const int N = weights.size(1);
+    const int G = tokens_per_expert.size(0);
 
-    if (tile_config == TileConfig::Auto) {
-        tile_config = auto_select_tile(tokens_per_expert, K, N);
+    // Async D2H to pinned memory + stream-level sync (not device-level).
+    // .cpu() in Python would trigger cudaDeviceSynchronize (blocks ALL
+    // streams); cudaStreamSynchronize only waits for the current stream.
+    const int64_t* tpe_cpu;
+    if (tokens_per_expert.is_cuda()) {
+        int64_t* pinned = get_pinned_tpe_buf(G);
+        cudaMemcpyAsync(pinned,
+                         tokens_per_expert.data_ptr<int64_t>(),
+                         G * sizeof(int64_t),
+                         cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        tpe_cpu = pinned;
+    } else {
+        tpe_cpu = tokens_per_expert.data_ptr<int64_t>();
     }
 
-    // cuBLAS sequential path — no CUTLASS, no TMA
+    // Filter out zero-token experts (CUTLASS TMA crashes on M=0).
+    // Build a compact mapping: filtered_idx[i] → original expert index.
+    // This replaces Python-side filtering so we avoid extra GPU syncs.
+    static thread_local std::vector<int64_t> filtered_tpe;
+    static thread_local std::vector<int> expert_map;
+    filtered_tpe.clear();
+    expert_map.clear();
+    for (int g = 0; g < G; ++g) {
+        if (tpe_cpu[g] > 0) {
+            filtered_tpe.push_back(tpe_cpu[g]);
+            expert_map.push_back(g);
+        }
+    }
+
+    const int G_eff = static_cast<int>(filtered_tpe.size());
+    if (G_eff == 0) {
+        return torch::empty({0, N},
+            torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+    }
+
+    // Use filtered arrays for tile selection and dispatch.
+    // expert_map is passed down so pointer arrays index into the right
+    // expert weights even though some original indices were skipped.
+    const int64_t* tpe_eff = filtered_tpe.data();
+
+    if (tile_config == TileConfig::Auto) {
+        tile_config = auto_select_tile(tpe_eff, G_eff, K, N);
+    }
+
+    const int* emap = expert_map.data();
+
     if (tile_config == TileConfig::CuBLAS_Seq) {
-        return launch_cublas_sequential(input, weights, tokens_per_expert, stream);
+        return launch_cublas_sequential(input, weights, tpe_cpu, G, stream);
     }
 
     if (input.scalar_type() == torch::kBFloat16) {
         switch (tile_config) {
             case TileConfig::Co_128x128x64:
-                return launch_grouped_gemm<BF16_128x128x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<BF16_128x128x64_Co>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::Co_128x256x64:
-                return launch_grouped_gemm<BF16_128x256x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<BF16_128x256x64_Co>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::PP_128x128x128:
-                return launch_grouped_gemm<BF16_128x128x128_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<BF16_128x128x128_PP>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::PP_128x256x64:
-                return launch_grouped_gemm<BF16_128x256x64_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<BF16_128x256x64_PP>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             default:
                 TORCH_CHECK(false, "Invalid tile config");
         }
     } else if (input.scalar_type() == torch::kHalf) {
         switch (tile_config) {
             case TileConfig::Co_128x128x64:
-                return launch_grouped_gemm<F16_128x128x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<F16_128x128x64_Co>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::Co_128x256x64:
-                return launch_grouped_gemm<F16_128x256x64_Co>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<F16_128x256x64_Co>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::PP_128x128x128:
-                return launch_grouped_gemm<F16_128x128x128_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<F16_128x128x128_PP>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             case TileConfig::PP_128x256x64:
-                return launch_grouped_gemm<F16_128x256x64_PP>(input, weights, tokens_per_expert, stream, sort_by_m);
+                return launch_grouped_gemm<F16_128x256x64_PP>(input, weights, tpe_eff, G_eff, emap, stream, sort_by_m);
             default:
                 TORCH_CHECK(false, "Invalid tile config");
         }
